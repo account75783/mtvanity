@@ -18,6 +18,56 @@ Vanity node ID generator for Meshtastic 2.8+ radios (Heltec V4 and others), in a
 
 From firmware 2.8, a Meshtastic node ID is the CRC-32 of the node's 32-byte X25519 public key, shown as `!xxxxxxxx`. `mtvanity` searches for a private key whose public key hashes to the ID you want.
 
+## Requirements
+
+- **64-bit only.** An x86_64 or 64-bit ARM CPU with a 64-bit operating system. The arithmetic uses 128-bit integers, so a 32-bit build is not possible.
+- **Minimum:** any 64-bit x86 CPU. AVX2 and carry-less multiply are used when the CPU has them and are not required.
+- **Recommended:** 4 cores of Intel 4th-gen Core (Haswell, 2013) or newer, or AMD Ryzen 1st gen (2017) or newer. That is predicted to find a full 8-digit ID in about a minute or less.
+- **Windows uses at most 64 logical CPUs.** A machine with more than 64 will only cost you money on Windows: the extra cores sit idle. Linux uses up to 1024.
+- **Systems:** Debian 12/13, Windows 11, Android (Termux).
+
+### How long a full 8-digit ID takes
+
+A full ID needs 4.29 billion keys on average. Rule of thumb: about 90 CPU cycles per key with AVX2 and about 185 without, so
+
+```
+seconds = 4.29e9 x cycles per key / (cores x clock speed in Hz)
+```
+
+Measured:
+
+| CPU | Keys per second | Average time |
+|---|---|---|
+| Intel Core i9-14900HX (laptop, 32 threads) | 516 M | about 8 s |
+| 2 cloud Xeon cores (Sapphire Rapids) | 62 M | about 70 s |
+
+Predicted from core counts and multiply speeds, **not measured**; treat each as good to within a factor of two:
+
+| CPU | Keys per second | Average time |
+|---|---|---|
+| 4-core Skylake desktop (i5-6500 class, 2015) | about 125 M | about 35 s |
+| 4-core Haswell desktop (i5-4590 class, 2013) | about 105 M | about 40 s |
+| Ryzen 5 1400 (4 cores, 2017) | about 65 M | about 65 s |
+| Intel N100 mini PC (4 cores, 2023) | about 50 M | about 1.5 min |
+| 2-core Haswell laptop (i5-4200U class) | about 37 M | about 2 min |
+
+### CPUs that will feel slow
+
+No 64-bit CPU is hopeless, but these are predicted to be slow enough to notice (same caveat: not measured):
+
+| CPU | Keys per second | Average time for a full ID |
+|---|---|---|
+| Raspberry Pi 4 (64-bit OS) | about 18 M | about 4 min |
+| Core 2 Duo (2006 to 2009) | about 14 M | about 5 min |
+| Celeron N2840 and other 2-core Bay Trail Atoms | about 7 M | about 10 min |
+| Raspberry Pi 3 or Zero 2 W (64-bit OS) | about 5 M | about 15 min |
+| Single-core Athlon 64 or 64-bit Pentium 4 | 3 to 5 M | 15 to 20 min |
+| First-generation Atom netbook or nettop (D510, N450) | about 2 M | about 35 min |
+
+- **Averages hide bad luck.** One search in twenty takes more than three times the average, so the last row can run for two hours.
+- **Shorter IDs are far easier.** Each digit you drop is 16 times faster; a 7-digit prefix takes about 2 minutes even on the slowest row.
+- **Cannot run at all:** 32-bit CPUs and 32-bit operating systems. That covers the Pentium M, Core Duo, Atom N270, Raspberry Pi Zero and Pi 1, and 32-bit Raspberry Pi OS on any Pi.
+
 ## Build
 
 Each block is one line: install the tools, clone, build and run the self-test.
@@ -41,6 +91,32 @@ pkg install -y git clang && git clone https://github.com/account75783/mtvanity.g
 ```
 
 Already have the source? Skip the clone and run only the `gcc` or `clang` part. To measure speed, run `./mtvanity --benchmark`.
+
+### Release binaries
+
+Release builds add `-s -static`, so the program needs no shared libraries.
+
+Linux x86_64:
+
+```
+gcc -O3 -s -static -pthread mtvanity.c -o mtvanity-linux-x86_64 -lm
+```
+
+Windows x86_64 (MSYS2 UCRT64 shell):
+
+```
+gcc -O3 -s -static -Wa,-muse-unaligned-vector-move mtvanity.c -o mtvanity-windows-x86_64.exe -lbcrypt
+```
+
+### Verifying a release
+
+Releases are signed with the maintainer's PGP key. Fingerprint: `PASTE-KEY-FINGERPRINT-HERE`
+
+```
+curl -s https://github.com/account75783.gpg | gpg --import && gpg --verify SHA256SUMS.asc SHA256SUMS && sha256sum -c --ignore-missing SHA256SUMS
+```
+
+Check that the fingerprint `gpg` prints matches the one above. Windows shows a SmartScreen warning for the `.exe` because it carries no paid code-signing certificate; the PGP signature is how you know it is genuine.
 
 The `-Wa,-muse-unaligned-vector-move` flag is required with MinGW gcc (GCC bug 54412: 32-byte stack alignment on 64-bit Windows).
 
@@ -83,18 +159,18 @@ Checked:
 - Every hit is re-derived by the independent reference code before it is printed.
 - Clean under ASan, UBSan and TSan (gcc), and under strict warnings with gcc and clang.
 - An exact 8-digit ID was found end to end.
-
 - Confirmed by the human on a real radio running the latest 2.8 firmware (2026-11-17): after a generated key is written, the node ID re-derives to the chosen value.
+- The static Linux x86_64 release build passes the self-test and runs at the same speed as the normal build.
 
 Not yet checked (why this is a release candidate):
 
-- The native Windows build has only been syntax-checked (the laptop run used WSL).
+- The native Windows build, including its crash-dump suppression, has only been syntax-checked (the laptop run used WSL).
 - No measurements on a Ryzen 9 or on real ARM hardware.
 
 ## Security notes
 
 - Keys come from the OS random generator only (`getrandom`, `arc4random_buf`, `BCryptGenRandom`).
-- Private keys are written to stdout only, secrets are wiped after use, and core dumps are disabled.
+- Private keys are written to stdout only, secrets are wiped after use, and core dumps (Linux) and crash dumps (Windows, best effort) are disabled.
 - The search is not constant-time. Run it on a machine you trust.
 - A node ID is a 32-bit label, not proof of identity: anyone can generate a key with the same ID. The public key is what identifies a node.
 - IDs `!00000000` to `!00000003` and `!ffffffff` are reserved and refused.

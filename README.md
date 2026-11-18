@@ -4,6 +4,8 @@ Vanity node ID generator for Meshtastic 2.8+ radios (Heltec V4 and others), in a
 
 **Release:** V1-RC1 (release candidate, 2026-11-17)
 
+**Tested and working on Meshtastic firmware 2.8, the latest release, on 2026-11-17.** A generated key was written to a real radio and the node ID changed to the chosen value. (2.8.1 alpha was the current firmware release on that date.)
+
 ## Authorship
 
 **Authored by Claude Fable 5.2 (Max, with Research), assisted by a human.**
@@ -54,12 +56,13 @@ meshtastic --set security.private_key "base64:..."
 
 ## Performance
 
-Measured on 2 shared cloud cores (Xeon Sapphire Rapids, about 3 GHz, gcc 13.3):
+| Machine | Kernel | Keys per second | Average time for a full 8-digit ID |
+|---|---|---|---|
+| Intel Core i9-14900HX, 32 threads (WSL) | AVX2 | 516.4 M | about 8.3 s |
+| 2 shared cloud cores (Xeon Sapphire Rapids, about 3 GHz, gcc 13.3) | AVX2 | 60.2 M | about 71 s |
+| Same 2 cloud cores | Scalar | 33.2 M | about 2.2 min |
 
-| Kernel | Keys per second | Average time for a full 8-digit ID |
-|---|---|---|
-| Scalar | 33.2 M | about 2.2 min |
-| AVX2 | 60.2 M | about 71 s |
+Details of the laptop run are in `BENCHMARK-i9-14900HX.md`.
 
 How it gets there:
 
@@ -77,11 +80,12 @@ Checked:
 - Clean under ASan, UBSan and TSan (gcc), and under strict warnings with gcc and clang.
 - An exact 8-digit ID was found end to end.
 
+- Confirmed by the human on a real radio running the latest 2.8 firmware (2026-11-17): after a generated key is written, the node ID re-derives to the chosen value.
+
 Not yet checked (why this is a release candidate):
 
-- No key from this tool has been loaded onto a real radio.
-- The Windows build has only been syntax-checked.
-- No measurements on the target CPUs (i9-14900HX, Ryzen 9) or on real ARM hardware.
+- The native Windows build has only been syntax-checked (the laptop run used WSL).
+- No measurements on a Ryzen 9 or on real ARM hardware.
 
 ## Security notes
 

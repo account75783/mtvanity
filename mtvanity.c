@@ -19,6 +19,9 @@
  *   Android:  clang -O3 -march=armv8-a+crc -pthread mtvanity.c -o mtvanity -lm
  *   The x86 kernels are selected at run time, so one binary serves every
  *   x86-64 CPU and -march=native is not needed.
+ *   Add -s -static for a release binary that needs no shared libraries.
+ *   A 64-bit target is required (the field arithmetic uses 128-bit
+ *   integers).  On Windows at most 64 logical CPUs are used.
  *
  * USE
  *   ./mtvanity --self-test       check every component against a reference
@@ -60,7 +63,8 @@
  *   - A base scalar is retired after its first hit, so two keys this
  *     program prints are never a small known offset apart.
  *   - Private keys are written to stdout only, never to disk or logs, and
- *     core dumps are disabled.
+ *     core dumps (Linux) and crash dumps (Windows, best effort) are
+ *     disabled.
  *   - The search is deliberately NOT constant-time: it is an offline tool.
  *     Do not run it on a machine you share with people you do not trust.
  *   - A vanity key is an ordinary random key with one chosen public
@@ -107,6 +111,7 @@
 #ifdef _WIN32
 #  include <windows.h>
 #  include <bcrypt.h>
+#  include <io.h>
 #  include <malloc.h>
 #else
 #  include <pthread.h>
@@ -351,10 +356,34 @@ static void os_pin_thread(int slot)
 #endif
 }
 
-/* A crash must not leave private keys in a core file. */
+#ifdef _WIN32
+/*
+ * Last-chance exception handler.  Ending the process here keeps Windows
+ * Error Reporting from attaching to it and writing a dump of memory that
+ * holds private keys.  The exit status is the exception code, as it would
+ * have been without the handler.
+ */
+static LONG WINAPI on_fatal_exception(EXCEPTION_POINTERS *info)
+{
+    const UINT code = (info != NULL && info->ExceptionRecord != NULL)
+                          ? (UINT)info->ExceptionRecord->ExceptionCode
+                          : 3u;
+    TerminateProcess(GetCurrentProcess(), code);
+    return EXCEPTION_EXECUTE_HANDLER;
+}
+#endif
+
+/*
+ * A crash must not leave private keys in a core file or a crash dump.
+ * Best effort on Windows: the error mode and the handler cover ordinary
+ * faults, but a fail-fast abort raised by the system itself bypasses both.
+ */
 static void os_disable_core_dumps(void)
 {
-#ifndef _WIN32
+#ifdef _WIN32
+    SetErrorMode(SEM_FAILCRITICALERRORS | SEM_NOGPFAULTERRORBOX | SEM_NOOPENFILEERRORBOX);
+    SetUnhandledExceptionFilter(on_fatal_exception);
+#else
     const struct rlimit none = {0, 0};
     (void)setrlimit(RLIMIT_CORE, &none);
 #endif
@@ -1364,12 +1393,65 @@ static struct {
     uint64_t    hits_wanted;
     uint64_t    hits;               /* guarded by the output lock              */
     hit_t      *capture;            /* OUT_CAPTURE: array of hits_wanted slots */
-    int         progress_shown;     /* a progress line is on the terminal      */
+    int         progress_width;     /* columns of the progress line shown, or 0 */
     atomic_int  stop;
     atomic_ullong faults;           /* fast-path results the reference refused */
 } g_run;
 
 static volatile sig_atomic_t g_interrupted;
+
+#define PROGRESS_COLUMNS 79         /* widest progress line: never wraps at 80 */
+
+/*
+ * Hand a whole progress update to the terminal in one write.  Some C
+ * libraries send formatted output on an unbuffered stream one character at
+ * a time, and a terminal then shows the line being redrawn left to right.
+ * stderr is unbuffered, so going around stdio cannot reorder anything.
+ */
+static void progress_write(const char *text, size_t n)
+{
+#ifdef _WIN32
+    (void)_write(_fileno(stderr), text, (unsigned)n);
+#else
+    if (write(STDERR_FILENO, text, n) < 0) {
+        /* progress is decoration: nothing to do if the terminal is gone */
+    }
+#endif
+}
+
+/* Draw LINE over the progress line, padded so it also covers a longer one. */
+static void progress_draw(const char *line)
+{
+    char out[PROGRESS_COLUMNS + 2];
+    int width = (int)strlen(line);
+
+    if (width > PROGRESS_COLUMNS)
+        width = PROGRESS_COLUMNS;
+    if (width > g_run.progress_width)
+        g_run.progress_width = width;
+    out[0] = '\r';
+    memset(out + 1, ' ', (size_t)g_run.progress_width);
+    memcpy(out + 1, line, (size_t)width);
+    progress_write(out, (size_t)g_run.progress_width + 1);
+}
+
+/*
+ * Erase the progress line, if one is showing, over its full width so that
+ * nothing of it is left behind whatever is printed next.  The caller of
+ * either function holds the output lock or is the only thread writing.
+ */
+static void progress_clear(void)
+{
+    char out[PROGRESS_COLUMNS + 2];
+
+    if (g_run.progress_width > 0) {
+        out[0] = '\r';
+        memset(out + 1, ' ', (size_t)g_run.progress_width);
+        out[g_run.progress_width + 1] = '\r';
+        progress_write(out, (size_t)g_run.progress_width + 2);
+    }
+    g_run.progress_width = 0;
+}
 
 static void on_interrupt(int sig)
 {
@@ -1431,8 +1513,7 @@ static void print_hit(uint64_t number, const hit_t *h)
     base64_encode(sk_b64, h->secret, 32);
     base64_encode(pk_b64, h->public_key, 32);
 
-    if (g_run.progress_shown)
-        fprintf(stderr, "\r%78s\r", "");
+    progress_clear();
     if (g_run.mode == OUT_JSON) {
         printf("{\"node_id\":\"!%08" PRIx32 "\",\"node_num\":%" PRIu32 ","
                "\"private_key_hex\":\"%s\",\"private_key_base64\":\"%s\","
@@ -2374,6 +2455,23 @@ static void worker_main(void *arg)
     (void)worker_search(wk, best, 0.0);
 }
 
+/* A key count for people: "65.5 thousand", "1.72 billion". */
+static void format_count(char *out, size_t n, double count)
+{
+    static const char *const unit[] = {"", " thousand", " million", " billion", " trillion"};
+    size_t u = 0;
+    double v = count;
+
+    while (v >= 999.5 && u + 1 < ARRAY_LEN(unit)) {
+        v /= 1e3;
+        u++;
+    }
+    if (u == 0)
+        snprintf(out, n, "%.0f", v);
+    else
+        snprintf(out, n, "%.*f%s", v < 9.995 ? 2 : v < 99.95 ? 1 : 0, v, unit[u]);
+}
+
 static void format_duration(char *out, size_t n, double seconds)
 {
     if (seconds < 1.0)
@@ -2407,7 +2505,7 @@ static run_result engine_run(const backend_t *be, int nthreads, int pin, double 
 
     atomic_store(&g_run.stop, 0);
     g_run.hits = 0;
-    g_run.progress_shown = 0;
+    g_run.progress_width = 0;
 
     for (int i = 0; i < nthreads; i++) {
         worker_t *wk = &g_workers[i];
@@ -2444,16 +2542,18 @@ static run_result engine_run(const backend_t *be, int nthreads, int pin, double 
 
         if (show_progress && now - last_report >= 1.0) {
             const double rate = (double)res.keys / res.seconds;
-            char mean[32], p95[32];
+            char line[PROGRESS_COLUMNS + 1], count[32], mean[32], p95[32];
+            format_count(count, sizeof count, (double)res.keys);
             format_duration(mean, sizeof mean, expected / rate);
             format_duration(p95, sizeof p95, 3.0 * expected / rate);
+            /* cut off at the buffer on purpose: a progress line must not wrap */
+            if (snprintf(line, sizeof line,
+                         "%s keys, %.1f M/s, %.0f%% likely by now (avg %s, 95%% by %s)",
+                         count, rate / 1e6,
+                         100.0 * (1.0 - exp(-(double)res.keys / expected)), mean, p95) < 0)
+                line[0] = '\0';
             output_lock();
-            fprintf(stderr, "\r%.3g keys, %.1f M/s, %.0f%% chance of a hit by now"
-                            " (mean %s, 95%% within %s)   ",
-                    (double)res.keys, rate / 1e6,
-                    100.0 * (1.0 - exp(-(double)res.keys / expected)), mean, p95);
-            fflush(stderr);
-            g_run.progress_shown = 1;
+            progress_draw(line);
             output_unlock();
             last_report = now;
         }
@@ -2465,9 +2565,7 @@ static run_result engine_run(const backend_t *be, int nthreads, int pin, double 
     for (int i = 0; i < res.threads; i++)
         res.keys += atomic_load(&g_workers[i].keys);
     res.seconds = now_seconds() - start;
-    if (g_run.progress_shown)
-        fprintf(stderr, "\r%78s\r", "");
-    g_run.progress_shown = 0;
+    progress_clear();
 
     for (size_t b = 0; b < ARRAY_LEN(BACKENDS); b++) {
         int n = 0;
@@ -3327,18 +3425,22 @@ int main(int argc, char **argv)
     g_run.mode = json ? OUT_JSON : OUT_TEXT;
     g_run.hits_wanted = (uint64_t)hits_wanted;
     if (!quiet) {
-        fprintf(stderr, "searching %d target%s with %d fixed digit%s: about %.3g keys per hit, "
+        char count[32];
+        format_count(count, sizeof count, pattern_expected_keys());
+        fprintf(stderr, "searching %d target%s with %d fixed digit%s: about %s keys per hit, "
                         "%d thread%s\n",
                 g_pat.count, g_pat.count == 1 ? "" : "s",
                 g_pat.fixed_digits, g_pat.fixed_digits == 1 ? "" : "s",
-                pattern_expected_keys(), nthreads, nthreads == 1 ? "" : "s");
+                count, nthreads, nthreads == 1 ? "" : "s");
     }
 
     res = engine_run(be, nthreads, pin, 0.0, key_limit, !quiet);
 
     if (!quiet) {
-        fprintf(stderr, "%" PRIu64 " key%s found; %.3g tried in %.2f s (%.1f M/s; kernels: %s)%s\n",
-                g_run.hits, g_run.hits == 1 ? "" : "s", (double)res.keys, res.seconds,
+        char count[32];
+        format_count(count, sizeof count, (double)res.keys);
+        fprintf(stderr, "%" PRIu64 " key%s found; %s keys tried in %.2f s (%.1f M/s; kernels: %s)%s\n",
+                g_run.hits, g_run.hits == 1 ? "" : "s", count, res.seconds,
                 (double)res.keys / res.seconds / 1e6, res.kernels[0] ? res.kernels : "none",
                 g_interrupted ? "; interrupted" : "");
     }

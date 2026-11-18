@@ -102,3 +102,19 @@ Not yet checked (why this is a release candidate):
 ## License
 
 MIT.
+
+---
+
+## ⚠️ CHECK THAT THE ID IS OPEN FIRST
+
+**Do not use another person's node ID.** Two nodes with the same ID disrupt traffic on the mesh: messages, routing and other people's node lists can all get confused, for them and for you.
+
+Before you write a key to your radio, check that nobody on your mesh already has that ID:
+
+```
+meshtastic --nodes | grep -i 66666666 || echo "not seen by this radio"
+```
+
+Your radio only knows the nodes it has heard, so also check your local mesh map or ask in your mesh's group chat.
+
+Take someone else's ID on purpose and expect to get T-hunted: the people whose mesh you broke will track down your transmitter.

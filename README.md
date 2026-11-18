@@ -2,6 +2,22 @@
 
 Vanity node ID generator for Meshtastic 2.8+ radios (Heltec V4 and others), in a single C file.
 
+## ⚠️ CHECK THAT THE ID IS OPEN FIRST
+
+**Do not use another person's node ID.** Two nodes with the same ID disrupt traffic on the mesh: messages, routing and other people's node lists can all get confused, for them and for you.
+
+Before you write a key to your radio, check that nobody on your mesh already has that ID:
+
+```
+meshtastic --nodes | grep -i NODEHASHHERE || echo "not seen by this radio"
+```
+
+Your radio only knows the nodes it has heard, so also check your local mesh map or ask in your mesh's group chat.
+
+Take someone else's ID on purpose and expect to get T-hunted: the people whose mesh you broke will track down your transmitter. You will probably get blocked by the mesh too, with other operators ignoring your node so that nothing you send gets through.
+
+## Status
+
 **Release:** V1 (2026-11-18)
 
 **Tested and working on Meshtastic firmware 2.8, the latest release, on 2026-11-17.** A generated key was written to a real radio and the node ID changed to the chosen value. (2.8.1 alpha was the current firmware release on that date.)
@@ -100,32 +116,52 @@ Release builds add `-s -static`, so the program needs no shared libraries.
 Linux x86_64:
 
 ```
-gcc -O3 -s -static -pthread mtvanity.c -o mtvanity-linux-x86_64 -lm
+gcc -O3 -s -static -pthread mtvanity.c -o mtvanity-linux-x86_64-V1 -lm
 ```
 
 Windows x86_64, cross-compiled on Debian or WSL (this is how the release `.exe` is built):
 
 ```
-sudo apt install -y gcc-mingw-w64-x86-64 && x86_64-w64-mingw32-gcc -O3 -s -static -Wa,-muse-unaligned-vector-move mtvanity.c -o mtvanity-windows-x86_64.exe -lbcrypt
+sudo apt install -y gcc-mingw-w64-x86-64 && x86_64-w64-mingw32-gcc -O3 -s -static -Wa,-muse-unaligned-vector-move mtvanity.c -o mtvanity-windows-x86_64-V1.exe -lbcrypt
 ```
 
 Windows x86_64, built on Windows itself (MSYS2 UCRT64 shell):
 
 ```
-gcc -O3 -s -static -Wa,-muse-unaligned-vector-move mtvanity.c -o mtvanity-windows-x86_64.exe -lbcrypt
+gcc -O3 -s -static -Wa,-muse-unaligned-vector-move mtvanity.c -o mtvanity-windows-x86_64-V1.exe -lbcrypt
 ```
+
+The `-Wa,-muse-unaligned-vector-move` flag is required with MinGW gcc (GCC bug 54412: 32-byte stack alignment on 64-bit Windows).
 
 ### Verifying a release
 
-Releases are signed with the maintainer's PGP key. Fingerprint: `PASTE-KEY-FINGERPRINT-HERE`
+Releases are signed with the maintainer's PGP key (RSA 4096). Fingerprint:
 
 ```
-curl -s https://github.com/account75783.gpg | gpg --import && gpg --verify SHA256SUMS.asc SHA256SUMS && sha256sum -c --ignore-missing SHA256SUMS
+F7DB ECD8 5737 C463 7C7A  9EE1 564D EAE8 5007 BB49
 ```
 
-Check that the fingerprint `gpg` prints matches the one above. Windows shows a SmartScreen warning for the `.exe` because it carries no paid code-signing certificate; the PGP signature is how you know it is genuine.
+Download the binary you want and `SHA256SUMS.asc` into one folder.
 
-The `-Wa,-muse-unaligned-vector-move` flag is required with MinGW gcc (GCC bug 54412: 32-byte stack alignment on 64-bit Windows).
+Linux:
+
+```
+curl -s https://github.com/account75783.gpg | gpg --import && gpg -d SHA256SUMS.asc | sed 's#  .*/#  #' | sha256sum -c --ignore-missing
+```
+
+You need to see both `Good signature`, with the fingerprint above, and `OK` next to the file name. Then make the download executable: `chmod +x mtvanity-linux-x86_64-V1`.
+
+Windows (with Gpg4win installed):
+
+```
+curl -s https://github.com/account75783.gpg | gpg --import & gpg -d SHA256SUMS.asc & certutil -hashfile mtvanity-windows-x86_64-V1.exe SHA256
+```
+
+You need to see `Good signature`, with the fingerprint above, and the hash `certutil` prints must equal the one listed for the `.exe`.
+
+- The checksums sit inside the signed message, so the hashes being compared are the ones that were signed.
+- The `sed` step drops the folder names the list was made with, because release downloads arrive without folders.
+- Windows shows a SmartScreen warning for the `.exe` because it carries no paid code-signing certificate; the PGP signature is how you know it is genuine.
 
 ## Use
 
@@ -188,20 +224,4 @@ Not yet checked:
 
 ## License
 
-MIT.
-
----
-
-## ⚠️ CHECK THAT THE ID IS OPEN FIRST
-
-**Do not use another person's node ID.** Two nodes with the same ID disrupt traffic on the mesh: messages, routing and other people's node lists can all get confused, for them and for you.
-
-Before you write a key to your radio, check that nobody on your mesh already has that ID:
-
-```
-meshtastic --nodes | grep -i NODEHASHHERE || echo "not seen by this radio"
-```
-
-Your radio only knows the nodes it has heard, so also check your local mesh map or ask in your mesh's group chat.
-
-Take someone else's ID on purpose and expect to get T-hunted: the people whose mesh you broke will track down your transmitter.
+MIT. See `LICENSE`.

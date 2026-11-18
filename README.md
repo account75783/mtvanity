@@ -230,10 +230,6 @@ MIT. See `LICENSE`.
 
 If mtvanity gave you a fun node ID, tips are welcome in Monero (XMR):
 
-## Support
-
-If mtvanity gave you a fun node ID, tips are welcome in Monero (XMR):
-
     -----BEGIN PGP SIGNED MESSAGE-----
 Hash: SHA512
 

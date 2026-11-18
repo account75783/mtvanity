@@ -2,7 +2,7 @@
 
 Vanity node ID generator for Meshtastic 2.8+ radios (Heltec V4 and others), in a single C file.
 
-**Release:** V1-RC1 (release candidate, 2026-11-17)
+**Release:** V1 (2026-11-18)
 
 **Tested and working on Meshtastic firmware 2.8, the latest release, on 2026-11-17.** A generated key was written to a real radio and the node ID changed to the chosen value. (2.8.1 alpha was the current firmware release on that date.)
 
@@ -172,7 +172,7 @@ Checked:
 - The static Linux x86_64 release build passes the self-test and runs at the same speed as the normal build.
 - The native Windows x86_64 build (static, MinGW-w64 gcc) passes the full self-test and the benchmark on Windows 11 on the i9-14900HX (2026-11-18).
 
-Not yet checked (why this is a release candidate):
+Not yet checked:
 
 - The Windows crash-dump suppression has never been exercised by a real crash.
 - The MSYS2 build line for Windows has not been run; the tested `.exe` was cross-compiled.

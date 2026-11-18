@@ -20,23 +20,27 @@ From firmware 2.8, a Meshtastic node ID is the CRC-32 of the node's 32-byte X255
 
 ## Build
 
-Debian 12/13:
+Each block is one line: install the tools, clone, build and run the self-test.
+
+Debian 12/13 (also WSL):
 
 ```
-gcc -O3 -pthread mtvanity.c -o mtvanity -lm && ./mtvanity --self-test && ./mtvanity --benchmark
+sudo apt install -y git build-essential && git clone https://github.com/account75783/mtvanity.git && cd mtvanity && gcc -O3 -pthread mtvanity.c -o mtvanity -lm && ./mtvanity --self-test
 ```
 
-Windows 11 (MSYS2 UCRT64):
+Windows 11 (MSYS2 UCRT64 shell):
 
 ```
-gcc -O3 -Wa,-muse-unaligned-vector-move mtvanity.c -o mtvanity.exe -lbcrypt && ./mtvanity.exe --self-test
+pacman -S --needed --noconfirm git mingw-w64-ucrt-x86_64-gcc && git clone https://github.com/account75783/mtvanity.git && cd mtvanity && gcc -O3 -Wa,-muse-unaligned-vector-move mtvanity.c -o mtvanity.exe -lbcrypt && ./mtvanity.exe --self-test
 ```
 
 Android (Termux):
 
 ```
-clang -O3 -march=armv8-a+crc -pthread mtvanity.c -o mtvanity -lm && ./mtvanity --self-test
+pkg install -y git clang && git clone https://github.com/account75783/mtvanity.git && cd mtvanity && clang -O3 -march=armv8-a+crc -pthread mtvanity.c -o mtvanity -lm && ./mtvanity --self-test
 ```
+
+Already have the source? Skip the clone and run only the `gcc` or `clang` part. To measure speed, run `./mtvanity --benchmark`.
 
 The `-Wa,-muse-unaligned-vector-move` flag is required with MinGW gcc (GCC bug 54412: 32-byte stack alignment on 64-bit Windows).
 

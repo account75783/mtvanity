@@ -38,7 +38,8 @@ Measured:
 
 | CPU | Keys per second | Average time |
 |---|---|---|
-| Intel Core i9-14900HX (laptop, 32 threads) | 516 M | about 8 s |
+| Intel Core i9-14900HX (laptop, 32 threads), Linux build under WSL | 516 M | about 8 s |
+| Same laptop, native Windows build | 496 M | about 9 s |
 | 2 cloud Xeon cores (Sapphire Rapids) | 62 M | about 70 s |
 
 Predicted from core counts and multiply speeds, **not measured**; treat each as good to within a factor of two:
@@ -102,7 +103,13 @@ Linux x86_64:
 gcc -O3 -s -static -pthread mtvanity.c -o mtvanity-linux-x86_64 -lm
 ```
 
-Windows x86_64 (MSYS2 UCRT64 shell):
+Windows x86_64, cross-compiled on Debian or WSL (this is how the release `.exe` is built):
+
+```
+sudo apt install -y gcc-mingw-w64-x86-64 && x86_64-w64-mingw32-gcc -O3 -s -static -Wa,-muse-unaligned-vector-move mtvanity.c -o mtvanity-windows-x86_64.exe -lbcrypt
+```
+
+Windows x86_64, built on Windows itself (MSYS2 UCRT64 shell):
 
 ```
 gcc -O3 -s -static -Wa,-muse-unaligned-vector-move mtvanity.c -o mtvanity-windows-x86_64.exe -lbcrypt
@@ -138,7 +145,9 @@ meshtastic --set security.private_key "base64:..."
 
 | Machine | Kernel | Keys per second | Average time for a full 8-digit ID |
 |---|---|---|---|
-| Intel Core i9-14900HX, 32 threads (WSL) | AVX2 | 516.4 M | about 8.3 s |
+| Intel Core i9-14900HX, 32 threads, Linux build under WSL | AVX2 | 516.4 M | about 8.3 s |
+| Same laptop, native Windows build | AVX2 | 495.9 M | about 8.7 s |
+| Same laptop, native Windows build | Scalar | 275.7 M | about 15.6 s |
 | 2 shared cloud cores (Xeon Sapphire Rapids, about 3 GHz, gcc 13.3) | AVX2 | 60.2 M | about 71 s |
 | Same 2 cloud cores | Scalar | 33.2 M | about 2.2 min |
 
@@ -161,10 +170,12 @@ Checked:
 - An exact 8-digit ID was found end to end.
 - Confirmed by the human on a real radio running the latest 2.8 firmware (2026-11-17): after a generated key is written, the node ID re-derives to the chosen value.
 - The static Linux x86_64 release build passes the self-test and runs at the same speed as the normal build.
+- The native Windows x86_64 build (static, MinGW-w64 gcc) passes the full self-test and the benchmark on Windows 11 on the i9-14900HX (2026-11-18).
 
 Not yet checked (why this is a release candidate):
 
-- The native Windows build, including its crash-dump suppression, has only been syntax-checked (the laptop run used WSL).
+- The Windows crash-dump suppression has never been exercised by a real crash.
+- The MSYS2 build line for Windows has not been run; the tested `.exe` was cross-compiled.
 - No measurements on a Ryzen 9 or on real ARM hardware.
 
 ## Security notes

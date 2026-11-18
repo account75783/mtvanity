@@ -199,7 +199,7 @@ MIT.
 Before you write a key to your radio, check that nobody on your mesh already has that ID:
 
 ```
-meshtastic --nodes | grep -i 66666666 || echo "not seen by this radio"
+meshtastic --nodes | grep -i NODEHASHHERE || echo "not seen by this radio"
 ```
 
 Your radio only knows the nodes it has heard, so also check your local mesh map or ask in your mesh's group chat.

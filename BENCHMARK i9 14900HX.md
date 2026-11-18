@@ -1,7 +1,7 @@
-# mtvanity V1-RC1 on the Intel Core i9-14900HX
+# mtvanity V1 on the Intel Core i9-14900HX
 
 Authored by Claude Fable 5.2 (Max, with Research), assisted by a human.
-Recorded 2026-11-17 from a run on the human's laptop.
+Recorded 2026-11-17 (Linux build under WSL, release candidate) and 2026-11-18 (native Windows build) on the human's laptop.
 
 ## Result
 
@@ -53,8 +53,20 @@ The per-thread average is lower on the laptop because the 32 threads are a mix: 
 
 The pre-run estimate for a full ID on this CPU was 5 to 8 seconds. The measured average of about 8.3 seconds lands just past the slow end of that range.
 
+## Native Windows build (2026-11-18)
+
+The static Windows `.exe` (MinGW-w64 gcc) passed the full self-test on the same laptop, then ran `--benchmark` at 5 seconds per line on 32 threads:
+
+| Kernel | Keys per second | Average time for a full 8-digit ID |
+|---|---|---|
+| AVX2 | 495.9 M | about 8.7 s |
+| Scalar | 275.7 M | about 15.6 s |
+| Auto (chose AVX2 on all 32 threads) | 476.0 M | about 9.0 s |
+
+Native Windows is within a few percent of the Linux build under WSL. The gap between the AVX2 and Auto lines is the same kernel measured twice, so it shows the run-to-run variation on this laptop (heat, background load) rather than a real difference.
+
 ## Caveats
 
-- This is one search run, not a `--benchmark` run. A sustained run on a laptop may be slower once it heats up.
-- Native Windows and native Linux builds were not measured; this is WSL only.
+- The WSL figure comes from one search run, not a `--benchmark` run. A sustained run on a laptop may be slower once it heats up.
+- The first table is from the Linux build under WSL. Native Linux (without Windows underneath) was not measured.
 - Private keys from these runs are deliberately left out of this file.

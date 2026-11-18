@@ -140,7 +140,7 @@
 #  define MTV_ARM_CRC 1
 #endif
 
-#define MTV_VERSION     "2.0.0"
+#define MTV_VERSION     "V1-RC1"
 #define MTV_ATTRIBUTION "Authored by Claude, assisted by a human."
 
 /* A window is the 2W+1 keys centred on one point; W is also the table size. */

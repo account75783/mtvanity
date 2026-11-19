@@ -254,11 +254,3 @@ NwETjXUSLqnBfglS85+pFXQq
 -----END PGP SIGNATURE-----
 
 This address is signed with the same key as the releases. Verify it with `gpg --verify DONATE.txt.asc`.
-
-## Support
-
-If mtvanity gave you a fun node ID, tips are welcome in Monero (XMR):
-
-    87MusZ465nXZUb96BfWjgMjDfAqEffuahNjsyefTVhwuF9QQJmw9qDM7auju8vFdpAVJfj8bZZ9SKj5DdQaKKqD1LBnu3pD
-
-This address is signed with the same key as the releases. Verify it with `gpg --verify DONATE.txt.asc`.

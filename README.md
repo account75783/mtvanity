@@ -1,6 +1,6 @@
 # mtvanity
 
-Vanity node ID generator for Meshtastic 2.8+ radios (Heltec V4 and others), in a single C file.
+Vanity node ID and public key generator for Meshtastic 2.8+ radios (Heltec V4 and others), in a single C file.
 
 ## ⚠️ CHECK THAT THE ID IS OPEN FIRST
 
@@ -18,21 +18,25 @@ Take someone else's ID on purpose and expect to get T-hunted: the people whose m
 
 ## Status
 
-**Release:** V1 (2026-11-18)
+**Release:** V1.1 (2026-11-21)
 
-**Tested and working on Meshtastic firmware 2.8, the latest release, on 2026-11-17.** A generated key was written to a real radio and the node ID changed to the chosen value. (2.8.1 alpha was the current firmware release on that date.)
+**New in V1.1: vanity public keys.** You can now choose how the public key starts or ends as well as the node ID, ask for both in one key, and search for several keys in one run.
+
+**Tested and working on Meshtastic firmware 2.8, the latest release, on 2026-11-17.** A generated key was written to a real radio and the node ID changed to the chosen value. (2.8.1 alpha was the current firmware release on that date. The test was done with V1; V1.1 makes the same kind of key.)
 
 ## Authorship
 
 **Authored by Claude Fable 5.2 (Max, with Research), assisted by a human.**
 
 - Design, code, tests and this document were written by Claude Fable 5.2 (model ID `claude-fable-5-2`), Anthropic's AI model.
-- 2+ hours of research and engineering so far.
+- 4+ hours of research and engineering so far.
 - A human set the goal, chose the target hardware, corrected the firmware assumptions and directed the work.
 
 ## What it does
 
 From firmware 2.8, a Meshtastic node ID is the CRC-32 of the node's 32-byte X25519 public key, shown as `!xxxxxxxx`. `mtvanity` searches for a private key whose public key hashes to the ID you want.
+
+**New in V1.1:** it can also choose the public key itself, the base64 text the Meshtastic apps show for a node. `./mtvanity key:Mesh` finds a key whose public key starts with `Mesh`, `./mtvanity id:c0de+key:Me` finds one key with both a chosen node ID and a chosen public key, and one run can search for several keys at once. The patterns are listed under [Use](#use).
 
 ## Requirements
 
@@ -85,6 +89,23 @@ No 64-bit CPU is hopeless, but these are predicted to be slow enough to notice (
 - **Shorter IDs are far easier.** Each digit you drop is 16 times faster; a 7-digit prefix takes about 2 minutes even on the slowest row.
 - **Cannot run at all:** 32-bit CPUs and 32-bit operating systems. That covers the Pentium M, Core Duo, Atom N270, Raspberry Pi Zero and Pi 1, and 32-bit Raspberry Pi OS on any Pi.
 
+### How long a vanity public key takes
+
+Every character you fix at the start of a public key multiplies the work by 64. At 500 million keys per second, roughly the i9-14900HX figure above:
+
+| Characters fixed at the start | Average keys needed | Average time |
+|---|---|---|
+| 3 | 262 thousand | instant |
+| 4 | 16.8 million | 0.03 s |
+| 5 | 1.07 billion | about 2 s |
+| 6 | 68.7 billion | about 2.3 min |
+| 7 | 4.40 trillion | about 2.4 hours |
+| 8 | 281 trillion | about 6.5 days |
+
+- **`-i` halves the work for every letter**, because either case is accepted.
+- **A node ID and a public key multiply.** Four ID digits with three key characters is 17 billion keys, about 35 s. A full 8-digit ID with just two key characters is 17.6 trillion keys, about 10 hours.
+- **`mtvanity` prints the work for each target before it starts**, and warns once the estimate passes a day.
+
 ## Build
 
 Each block is one line: install the tools, clone, build and run the self-test.
@@ -116,19 +137,19 @@ Release builds add `-s -static`, so the program needs no shared libraries.
 Linux x86_64:
 
 ```
-gcc -O3 -s -static -pthread mtvanity.c -o mtvanity-linux-x86_64-V1 -lm
+gcc -O3 -s -static -pthread mtvanity.c -o mtvanity-linux-x86_64-V1.1 -lm
 ```
 
 Windows x86_64, cross-compiled on Debian or WSL (this is how the release `.exe` is built):
 
 ```
-sudo apt install -y gcc-mingw-w64-x86-64 && x86_64-w64-mingw32-gcc -O3 -s -static -Wa,-muse-unaligned-vector-move mtvanity.c -o mtvanity-windows-x86_64-V1.exe -lbcrypt
+sudo apt install -y gcc-mingw-w64-x86-64 && x86_64-w64-mingw32-gcc -O3 -s -static -Wa,-muse-unaligned-vector-move mtvanity.c -o mtvanity-windows-x86_64-V1.1.exe -lbcrypt
 ```
 
 Windows x86_64, built on Windows itself (MSYS2 UCRT64 shell):
 
 ```
-gcc -O3 -s -static -Wa,-muse-unaligned-vector-move mtvanity.c -o mtvanity-windows-x86_64-V1.exe -lbcrypt
+gcc -O3 -s -static -Wa,-muse-unaligned-vector-move mtvanity.c -o mtvanity-windows-x86_64-V1.1.exe -lbcrypt
 ```
 
 The `-Wa,-muse-unaligned-vector-move` flag is required with MinGW gcc (GCC bug 54412: 32-byte stack alignment on 64-bit Windows).
@@ -149,12 +170,12 @@ Linux:
 curl -s https://github.com/account75783.gpg | gpg --import && gpg -d SHA256SUMS.asc | sed 's#  .*/#  #' | sha256sum -c --ignore-missing
 ```
 
-You need to see both `Good signature`, with the fingerprint above, and `OK` next to the file name. Then make the download executable: `chmod +x mtvanity-linux-x86_64-V1`.
+You need to see both `Good signature`, with the fingerprint above, and `OK` next to the file name. Then make the download executable: `chmod +x mtvanity-linux-x86_64-V1.1`.
 
 Windows (with Gpg4win installed):
 
 ```
-curl -s https://github.com/account75783.gpg | gpg --import & gpg -d SHA256SUMS.asc & certutil -hashfile mtvanity-windows-x86_64-V1.exe SHA256
+curl -s https://github.com/account75783.gpg | gpg --import & gpg -d SHA256SUMS.asc & certutil -hashfile mtvanity-windows-x86_64-V1.1.exe SHA256
 ```
 
 You need to see `Good signature`, with the fingerprint above, and the hash `certutil` prints must equal the one listed for the `.exe`.
@@ -166,9 +187,58 @@ You need to see `Good signature`, with the fingerprint above, and the hash `cert
 ## Use
 
 ```
-./mtvanity c0de          # ID starting with c0de
-./mtvanity c0ffee42      # exact 8-digit ID
-./mtvanity --help        # wildcards, lists, threads, JSON output
+./mtvanity c0de                  # node ID starting with c0de
+./mtvanity c0ffee42              # exact 8-digit node ID
+./mtvanity 'id:*beef'            # node ID ending with beef
+./mtvanity key:Mesh              # public key starting with Mesh
+./mtvanity 'key:*Radio='         # public key ending with Radio=
+./mtvanity id:c0de+key:Me        # one key with both
+./mtvanity dead beef key:Mesh    # three keys in one run, one for each target
+./mtvanity --help                # everything else: threads, JSON output, limits
+```
+
+What you can write:
+
+| You write | It means |
+|---|---|
+| `dead` or `id:dead` | the node ID (8 hex digits) starts with `dead` |
+| `key:Mesh` | the public key, in the base64 form the apps show, starts with `Mesh` |
+| `keyhex:c0ffee` | the public key written in hex starts with `c0ffee` |
+| `id:c0de+key:Me` | one key that fits both patterns |
+| `*` | any run of characters: `'id:*beef'` ends with `beef`, `'key:Me*Q='` starts with `Me` and ends with `Q=` |
+| `.` | any one character: `id:d..d.00d` |
+| `?d` `?l` `?u` `?h` `?H` `?s` `?a` | hashcat mask placeholders: a digit, a lower-case letter, an upper-case letter, a hex digit (lower case, upper case), `+` or `/`, any character |
+
+- **Public key patterns are case-sensitive.** Add `-i` to accept either case, which also makes the search faster.
+- **Quote patterns that contain `*` or `?`** so the shell leaves them alone. The Windows command prompt needs no quotes.
+- **Not every ending exists.** A public key always ends in one of `AEIMQUYcgkosw048` followed by `=`, and the character before that has limits too. `mtvanity` says so when a pattern is impossible and lists what is possible.
+- **Every target gets its own key, and they are searched together.** Five full node IDs take about 2.3 times as long as one, not 5 times. `--hits N` asks for N keys per target.
+- **Keys go to stdout and everything else to stderr**, so `./mtvanity dead beef > keys.txt` keeps the keys off the screen.
+
+Each key is printed as its own block, and a run with several targets ends with a summary:
+
+```
+$ ./mtvanity dead key:Mesh id:c0+key:AB
+mtvanity V1.1 (source revision 4)
+searching for 3 targets on 2 threads
+  target 1   node ID !dead*                 about 65.5 thousand keys per hit
+  target 2   public key Mesh*               about 16.8 million keys per hit
+  target 3   node ID !c0* + public key AB*  about 1.05 million keys per hit
+
+(two blocks like the one below, for targets 1 and 3)
+
+==== key 3 of 3 | target 2 | public key Mesh* ====
+  node ID:              !91ea5415
+  public key (base64):  Mesh/etcr9gYaoGaOuAvvCk414cwAyfRye+Wn0Q601Q=
+  public key (hex):     31eb21fdeb5cafd8186a819a3ae02fbc2938d787300327d1c9ef969f443ad354
+  private key (base64): ...
+  private key (hex):    ...
+  install with:         meshtastic --set security.private_key "base64:..."
+
+3 of 3 keys found; 3.92 million keys tried in 0.12 s (31.8 M/s; kernels: avx2 x2)
+  target 1   node ID !dead*                 !dead656f
+  target 2   public key Mesh*               !91ea5415
+  target 3   node ID !c0* + public key AB*  !c0a3c2eb
 ```
 
 Install the result on the radio (back up the old key first):
@@ -176,6 +246,34 @@ Install the result on the radio (back up the old key first):
 ```
 meshtastic --set security.private_key "base64:..."
 ```
+
+### What changed since V1
+
+New:
+
+- **Vanity public keys.** `key:` chooses how the base64 public key starts or ends, and `keyhex:` does the same for its hex form.
+- **A node ID and a public key in one key**, such as `id:c0de+key:Me`.
+- **Several keys in one run.** Up to 64 targets are searched together, each gets its own key, and the run ends with a summary.
+- **Mask patterns.** `*` for any run of characters, `.` for any one, and the hashcat placeholders `?d ?l ?u ?h ?H ?s ?a`.
+- **`-i`** accepts either case in a public key pattern.
+
+Changed:
+
+- **`*` now means "any run of characters".** In V1 it stood for a single digit; write `.` for that now. V1's `x` is refused, and `?` now starts a mask placeholder such as `?d`, so if you reuse an old pattern, check the line `mtvanity` prints before it starts.
+- **A list finds a key for every entry.** In V1, `dead,beef` stopped at the first match of either. Now both are found, and `--hits` counts per target.
+- **The printed block has a header line**, and JSON output gained `target` and `pattern`.
+- **Every search starts by naming its build**, for example `mtvanity V1.1 (source revision 4)`.
+- **The status line fits the width of the terminal.** When stderr is a file or a pipe, a plain progress line is written now and then instead.
+- **`kill` ends a search the way Ctrl-C does**, with the summary.
+
+Fixed:
+
+- **The Windows console keeps up.** Every message is written in one piece, and each search thread lets anything that is waiting for its CPU run first, a few thousand times a second. Before, with every CPU searching, the status line landed on a new row at each update.
+- **A key that cannot be written to stdout stops the search** with an error and exit status 1, instead of being lost without a word.
+- **Secrets are handled more tightly.** Two leftover temporaries are wiped, and a private key no longer passes through a C library buffer.
+- **Smaller things:** a CRC-32 that was computed for nothing with some combined targets, the thread count on Windows when the CPU mask is unavailable, and leftovers of `^C` on the summary line.
+
+The search kernels are the ones from V1, and the speed is the same.
 
 ## Performance
 
@@ -189,27 +287,35 @@ meshtastic --set security.private_key "base64:..."
 
 Details of the laptop run are in `BENCHMARK-i9-14900HX.md`.
 
+These figures were measured with V1. V1.1 uses the same search code and is as fast: on the two cloud cores, run back to back (the machine was a little faster that day than when the table was made), V1 and V1.1 both did 67 to 70 M keys per second for one node ID, and V1.1 did 72 M for a public key alone and 63 M with 64 node IDs at once. The slow case is a pattern with no fixed character at all, such as one made only of `?l`: about 42 M, because every key has to be looked at in full.
+
+On the laptop under Windows, V1.1 ran at 515.6 M keys per second with `--threads 24`, as many threads as it has cores: as fast as the best figure in the table for all 32.
+
 How it gets there:
 
 - Affine Montgomery walk with a shared denominator and batch inversion: 2.5 multiplications and 1 squaring per key.
 - AVX2 kernel running four walks per thread.
 - CRC-32 by five carry-less multiplications, no tables.
 - Each thread times both kernels on its own core and keeps the faster one.
+- One comparison per key: each target is boiled down to the bits every match must share, and a key is looked at closely only if those bits fit. When only public keys are asked for, the CRC-32 is skipped.
 
 ## Verification status
 
 Checked:
 
-- 32 self-test checks, including the RFC 7748 vectors, a published Meshtastic key, and a full window compared key by key against an independent X25519 ladder.
+- 44 self-test checks, including the RFC 7748 vectors, a published Meshtastic key, a full window compared key by key against an independent X25519 ladder, and the pattern matcher compared against a separate reading of the pattern language.
 - Every hit is re-derived by the independent reference code before it is printed.
+- 1,800 keys for node ID, public key and combined targets were re-derived outside the program by separate Python code (its own X25519, zlib's CRC-32, Python's base64 and a regex reading of each pattern). All matched.
 - Clean under ASan, UBSan and TSan (gcc), and under strict warnings with gcc and clang.
-- An exact 8-digit ID was found end to end.
-- Confirmed by the human on a real radio running the latest 2.8 firmware (2026-11-17): after a generated key is written, the node ID re-derives to the chosen value.
+- An exact 8-digit ID was found end to end, in the same run as a vanity public key.
+- Confirmed by the human on a real radio running the latest 2.8 firmware (2026-11-17), with a V1 key: after a generated key is written, the node ID re-derives to the chosen value.
 - The static Linux x86_64 release build passes the self-test and runs at the same speed as the normal build.
-- The native Windows x86_64 build (static, MinGW-w64 gcc) passes the full self-test and the benchmark on Windows 11 on the i9-14900HX (2026-11-18).
+- The native Windows x86_64 build (static, MinGW-w64 gcc) passes the full self-test on Windows 11 on the i9-14900HX (V1.1 on 2026-11-21; V1 also ran the benchmark there on 2026-11-18).
+- On that laptop under Windows, with a search thread on each of its 32 CPUs, the status line stays in place. Before the search threads gave way to other programs it did not: it landed on a new row at each update unless `--threads` was set below the number of CPUs.
 
 Not yet checked:
 
+- No key chosen by its public key has been written to a radio yet.
 - The Windows crash-dump suppression has never been exercised by a real crash.
 - The MSYS2 build line for Windows has not been run; the tested `.exe` was cross-compiled.
 - No measurements on a Ryzen 9 or on real ARM hardware.
@@ -219,8 +325,18 @@ Not yet checked:
 - Keys come from the OS random generator only (`getrandom`, `arc4random_buf`, `BCryptGenRandom`).
 - Private keys are written to stdout only, secrets are wiped after use, and core dumps (Linux) and crash dumps (Windows, best effort) are disabled.
 - The search is not constant-time. Run it on a machine you trust.
-- A node ID is a 32-bit label, not proof of identity: anyone can generate a key with the same ID. The public key is what identifies a node.
+- A node ID is a 32-bit label, not proof of identity: anyone can generate a key with the same ID. The public key is what identifies a node, and only the whole of it: anyone can also generate a key that starts or ends like yours.
+- A vanity key is as strong as any other. The search fixes a few public characters and leaves the private key random.
 - IDs `!00000000` to `!00000003` and `!ffffffff` are reserved and refused.
+
+## TODO
+
+Planned, with nothing written yet:
+
+1. **Nvidia GPU hardware acceleration.**
+2. **AMD GPU hardware acceleration**, after the Nvidia one.
+
+Both are meant to come as optional `.h` header libraries next to `mtvanity.c`, so that the CPU build stays a single C file with no extra dependencies.
 
 ## License
 
@@ -230,27 +346,6 @@ MIT. See `LICENSE`.
 
 If mtvanity gave you a fun node ID, tips are welcome in Monero (XMR):
 
-    -----BEGIN PGP SIGNED MESSAGE-----
-Hash: SHA512
-
-87MusZ465nXZUb96BfWjgMjDfAqEffuahNjsyefTVhwuF9QQJmw9qDM7auju8vFdpAVJfj8bZZ9SKj5DdQaKKqD1LBnu3pD
------BEGIN PGP SIGNATURE-----
-
-iQJ/BAEBCgBpFiEE99vs2Fc3xGN8ep7hVk3q6FAHu0kFAmr9zh0bFIAAAAAABAAO
-bWFudTIsMi41KzEuMTIsMiwxLxw1NDg4MjI5MythY2NvdW50NzU3ODNAdXNlcnMu
-bm9yZXBseS5naXRodWIuY29tAAoJEFZN6uhQB7tJ05QP/2IlOdpih9hqu1JxwS2A
-/I0OzwjOY00HwUo37LAJmQrUENmqX8zi2RoG3lR7qDWrOeDwqoKV7Fshy5tuaYQq
-KoHv5w7IfQA05nNQlj9mesTCh3amZrhhNNfYGnrCQ3MZReilU5oQ9kMYP4mft6Xd
-F9mlZb0Pfly0MvhfBAF6mREIiAX1RO6kQjRcpaFEmdY/tMKOWJcoM1X5Cpx1umdh
-DPUgPZF6JrDJviyutbPMJuK5TvQcs3QchVU6kcsF8bVwACo9VrnWwudv+SM4mWPB
-BnRMK7qeCqcok5gB7+m5RQGMcf5PDAM9zFY4Dy6DaTLZQchQR9IBQzN7ySp9N72z
-1wVj53JD0ZcEP4w60LxJwGzIeeMjugeJKzcdCQdOG60e3VHR2OypOYOa2NrY6MiQ
-89qKfaLg192gAvj5SrVOJEl4EiHMbgpxU5l5xPlnqUkBJBrBp4W7qTdMfLDlKbxW
-esqm8+ev6I/42gZE0Ro6iLk57CspDMeAu9EIVjPUO1aoTAaoicCV5fxi9uknZy+S
-jGxgzUJQVe8NzJBLRrJuzrHwkQI4HAh0ulPinSKJQDnch3OPNwFdOyZV8IJ6OHJC
-uMkEkB5pRAXvI+A7MXACCnfa0AVzgtisu6dKr2HDtVMmrgSX8qlIcCh9ItZjNfZw
-NwETjXUSLqnBfglS85+pFXQq
-=b1hp
------END PGP SIGNATURE-----
+    87MusZ465nXZUb96BfWjgMjDfAqEffuahNjsyefTVhwuF9QQJmw9qDM7auju8vFdpAVJfj8bZZ9SKj5DdQaKKqD1LBnu3pD
 
 This address is signed with the same key as the releases. Verify it with `gpg --verify DONATE.txt.asc`.

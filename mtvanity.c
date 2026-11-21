@@ -1,13 +1,13 @@
 /*
- * mtvanity - vanity node-ID generator for Meshtastic firmware 2.8 and later
+ * mtvanity - vanity node IDs and public keys for Meshtastic firmware 2.8+
  *
  * Authored by Claude, assisted by a human.
  *
  * Since firmware 2.8 a Meshtastic node number is the CRC-32 of the node's
  * 32-byte X25519 public key, displayed as "!%08x".  This program searches
- * for a private key whose node ID matches a pattern you choose.  (Older
- * firmware takes the number from the MAC address; a key changes nothing
- * there.)
+ * for private keys whose node ID, public key, or both look the way you ask.
+ * (Older firmware takes the number from the MAC address; a key changes
+ * nothing there.)
  *
  * BUILD
  *   Debian:   gcc -O3 -pthread mtvanity.c -o mtvanity -lm
@@ -27,7 +27,12 @@
  *   ./mtvanity --self-test       check every component against a reference
  *   ./mtvanity --benchmark       keys per second of each kernel on this machine
  *   ./mtvanity c0de              a key whose node ID begins !c0de
+ *   ./mtvanity 'id:*beef'        a key whose node ID ends in beef
+ *   ./mtvanity key:Mesh          a key whose public key (base64) begins Mesh
+ *   ./mtvanity id:c0de+key:Me    one key that does both
+ *   ./mtvanity dead beef cafe    three keys, searched for together
  *   ./mtvanity --help            patterns and options
+ *   Section 7 below describes the pattern language in full.
  *
  * HOW IT IS FAST
  *   1. Scalar walk.  Candidates are the clamped scalars s, s+8, s+16, ...
@@ -52,23 +57,32 @@
  *   7. Per-core choice.  Each thread times the kernels on the core it is
  *      bound to and keeps the faster one, which matters on CPUs that mix
  *      performance and efficiency cores.
+ *   8. One comparison per key.  Whatever is asked for is boiled down to
+ *      the bits every match must share; a key is examined closely only if
+ *      those bits fit.  Any number of targets of the same shape cost one
+ *      hashed look-up, and when only public keys are constrained the
+ *      CRC-32 is not computed at all.
  *
  * SECURITY
  *   - Keys come only from the operating system's CSPRNG.
  *   - Every hit is recomputed by an independent implementation (a plain
  *     RFC 7748 ladder on 16-bit limbs and a bitwise CRC) before it is
- *     shown.  A fault in the fast path can therefore lose a key but can
- *     never print a wrong one.  The same reference checks the fast path
- *     every time the program starts.
+ *     shown, and must agree with the fast path in both public key and node
+ *     ID.  A fault in the fast path can therefore lose a key but can never
+ *     print a wrong one.  The same reference checks the fast path every
+ *     time the program starts.
  *   - A base scalar is retired after its first hit, so two keys this
  *     program prints are never a small known offset apart.
  *   - Private keys are written to stdout only, never to disk or logs, and
- *     core dumps (Linux) and crash dumps (Windows, best effort) are
- *     disabled.
+ *     straight to the operating system, so that no C library buffer keeps
+ *     a copy.  Core dumps (Linux) and crash dumps (Windows, best effort)
+ *     are disabled.
  *   - The search is deliberately NOT constant-time: it is an offline tool.
  *     Do not run it on a machine you share with people you do not trust.
- *   - A vanity key is an ordinary random key with one chosen public
- *     property.  Pick an ID nobody on your mesh already uses.
+ *   - A vanity key is an ordinary random key with a few chosen public
+ *     properties, and anyone can make another that shares them: a node ID
+ *     or the start of a public key never proves who a node is.  Pick an ID
+ *     nobody on your mesh already uses.
  *
  * SPDX-License-Identifier: MIT
  *
@@ -111,10 +125,10 @@
 #ifdef _WIN32
 #  include <windows.h>
 #  include <bcrypt.h>
-#  include <io.h>
 #  include <malloc.h>
 #else
 #  include <pthread.h>
+#  include <sys/ioctl.h>
 #  include <sys/resource.h>
 #  include <time.h>
 #  include <unistd.h>
@@ -145,7 +159,8 @@
 #  define MTV_ARM_CRC 1
 #endif
 
-#define MTV_VERSION     "V1"
+#define MTV_VERSION     "V1.1"
+#define MTV_REVISION    4           /* of the source, so that a stale build can be told apart */
 #define MTV_ATTRIBUTION "Authored by Claude, assisted by a human."
 
 /* A window is the 2W+1 keys centred on one point; W is also the table size. */
@@ -162,17 +177,18 @@
 #define NOINLINE      __attribute__((noinline))
 #define ARRAY_LEN(a)  (sizeof(a) / sizeof((a)[0]))
 
+/* printf-style checking, in the dialect of whichever printf the platform's headers select */
+#ifdef __MINGW_PRINTF_FORMAT
+#  define PRINTF_LIKE(f, a) __attribute__((format(__MINGW_PRINTF_FORMAT, f, a)))
+#else
+#  define PRINTF_LIKE(f, a) __attribute__((format(printf, f, a)))
+#endif
+
 __extension__ typedef unsigned __int128 u128;
 
 /* ======================================================================== */
-/* 1. Small utilities                                                        */
+/* 1. Output and small utilities                                             */
 /* ======================================================================== */
-
-static void die(const char *msg)
-{
-    fprintf(stderr, "mtvanity: %s\n", msg);
-    exit(2);
-}
 
 /* Wipe memory in a way the optimiser may not remove. */
 static void secure_zero(void *p, size_t n)
@@ -180,6 +196,99 @@ static void secure_zero(void *p, size_t n)
     volatile unsigned char *v = (volatile unsigned char *)p;
     while (n--)
         *v++ = 0;
+}
+
+/*
+ * Everything this program prints goes through os_write, one call per
+ * message, and never through the C library's streams.  On Windows those
+ * streams hand an unbuffered console its text one character at a time; with
+ * every core busy searching, each of those tiny writes has to wait its turn
+ * and a line is seen being typed out from left to right.  Writing directly
+ * also leaves no copy of a private key behind in a stream buffer.
+ */
+enum { TO_STDOUT = 1, TO_STDERR = 2 };
+
+/* Write all n bytes of text.  Returns 0, or -1 if the stream will not take them. */
+static int os_write(int to, const char *text, size_t n)
+{
+#ifdef _WIN32
+    const HANDLE h = GetStdHandle(to == TO_STDOUT ? STD_OUTPUT_HANDLE : STD_ERROR_HANDLE);
+    char chunk[8192];       /* with "\r\n" for "\n", as the C library's text mode writes it */
+    int rc = 0;
+
+    while (n > 0 && rc == 0) {
+        DWORD len = 0, at = 0;
+
+        while (n > 0 && len < sizeof chunk - 1) {
+            if (*text == '\n')
+                chunk[len++] = '\r';
+            chunk[len++] = *text++;
+            n--;
+        }
+        while (at < len && rc == 0) {
+            DWORD done = 0;
+            if (!WriteFile(h, chunk + at, len - at, &done, NULL) || done == 0)
+                rc = -1;
+            at += done;
+        }
+        secure_zero(chunk, len);    /* it may have been a private key */
+    }
+    return rc;
+#else
+    while (n > 0) {
+        const ssize_t r = write(to == TO_STDOUT ? STDOUT_FILENO : STDERR_FILENO, text, n);
+
+        if (r < 0 && errno == EINTR)
+            continue;
+        if (r < 0 && errno == EAGAIN) {     /* a terminal someone left in non-blocking mode */
+            const struct timespec nap = {0, 1000000};
+            nanosleep(&nap, NULL);
+            continue;
+        }
+        if (r <= 0)
+            return -1;
+        text += r;
+        n -= (size_t)r;
+    }
+    return 0;
+#endif
+}
+
+/* Format a message and write it in one piece.  Messages are short; a longer one is cut off. */
+static int os_vprintf(int to, const char *fmt, va_list ap)
+{
+    char text[4096];
+    const int n = vsnprintf(text, sizeof text, fmt, ap);
+
+    if (n < 0)
+        return -1;
+    return os_write(to, text, (size_t)n < sizeof text ? (size_t)n : sizeof text - 1);
+}
+
+PRINTF_LIKE(1, 2)
+static void out_printf(const char *fmt, ...)
+{
+    va_list ap;
+
+    va_start(ap, fmt);
+    (void)os_vprintf(TO_STDOUT, fmt, ap);
+    va_end(ap);
+}
+
+PRINTF_LIKE(1, 2)
+static void err_printf(const char *fmt, ...)
+{
+    va_list ap;
+
+    va_start(ap, fmt);
+    (void)os_vprintf(TO_STDERR, fmt, ap);
+    va_end(ap);
+}
+
+static void die(const char *msg)
+{
+    err_printf("mtvanity: %s\n", msg);
+    exit(2);
 }
 
 static uint64_t load64_le(const uint8_t *p)
@@ -219,12 +328,30 @@ static void hex_decode(uint8_t *out, const char *hex, size_t n)
         out[i] = (uint8_t)((hex_digit(hex[2 * i]) << 4) | hex_digit(hex[2 * i + 1]));
 }
 
+static const char HEX_ALPHABET[] = "0123456789abcdef";
+static const char BASE64_ALPHABET[] =
+    "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+
+static char ascii_lower(char c)
+{
+    return c >= 'A' && c <= 'Z' ? (char)(c - 'A' + 'a') : c;
+}
+
+/* The other case of a letter; any other character as it is. */
+static char ascii_swap_case(char c)
+{
+    if (c >= 'A' && c <= 'Z')
+        return (char)(c - 'A' + 'a');
+    if (c >= 'a' && c <= 'z')
+        return (char)(c - 'a' + 'A');
+    return c;
+}
+
 static void hex_encode(char *out, const uint8_t *in, size_t n)
 {
-    static const char digits[] = "0123456789abcdef";
     for (size_t i = 0; i < n; i++) {
-        out[2 * i] = digits[in[i] >> 4];
-        out[2 * i + 1] = digits[in[i] & 15];
+        out[2 * i] = HEX_ALPHABET[in[i] >> 4];
+        out[2 * i + 1] = HEX_ALPHABET[in[i] & 15];
     }
     out[2 * n] = '\0';
 }
@@ -232,8 +359,7 @@ static void hex_encode(char *out, const uint8_t *in, size_t n)
 /* Standard base64 with padding; out needs 4 * ceil(n / 3) + 1 bytes. */
 static void base64_encode(char *out, const uint8_t *in, size_t n)
 {
-    static const char tab[] =
-        "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    const char *const tab = BASE64_ALPHABET;
     size_t o = 0;
     for (size_t i = 0; i < n; i += 3) {
         const uint32_t b0 = in[i];
@@ -306,11 +432,16 @@ static int os_cpu_count(void)
 {
 #if defined(_WIN32)
     DWORD_PTR process_mask, system_mask;
+    SYSTEM_INFO info;
     int n = 0;
     if (GetProcessAffinityMask(GetCurrentProcess(), &process_mask, &system_mask))
         for (; process_mask != 0; process_mask >>= 1)
             n += (int)(process_mask & 1);
-    return n > 0 ? n : 1;
+    if (n > 0)
+        return n;
+    /* no usable mask (the process is spread over several processor groups) */
+    GetSystemInfo(&info);
+    return info.dwNumberOfProcessors > 0 ? (int)info.dwNumberOfProcessors : 1;
 #else
 #  if defined(__linux__)
     cpu_set_t set;
@@ -353,6 +484,50 @@ static void os_pin_thread(int slot)
     }
 #else
     (void)slot;
+#endif
+}
+
+/*
+ * Let whatever is waiting for this CPU run now.  Every search thread calls
+ * this between two windows, a few thousand times a second.
+ *
+ * Windows makes a thread that becomes ready wait until the time slice of an
+ * equally important running thread is over, tens of milliseconds each time.
+ * With a search thread on every CPU the rest of the machine then runs in
+ * slow motion, the console first of all: with 32 threads on 32 CPUs the
+ * status line was seen to land on a new row at each update, and with 24
+ * threads it stayed in place.  A yield is one system call when nobody is
+ * waiting, far below a thousandth of the time a window takes.  It does
+ * mean that the search gives way to other busy programs instead of taking
+ * turns with them.  Linux lets a thread that wakes up in ahead of one that
+ * has been running, so nothing is needed there.
+ */
+static void os_yield(void)
+{
+#ifdef _WIN32
+    (void)SwitchToThread();
+#endif
+}
+
+/*
+ * The width of the terminal behind stderr, in columns; 0 if stderr is a file
+ * or a pipe.  Asked afresh for every progress line, since windows get resized.
+ */
+static int os_stderr_columns(void)
+{
+#ifdef _WIN32
+    CONSOLE_SCREEN_BUFFER_INFO info;
+
+    /* this succeeds for a console only; text wraps at the width of its buffer */
+    if (!GetConsoleScreenBufferInfo(GetStdHandle(STD_ERROR_HANDLE), &info))
+        return 0;
+    return info.dwSize.X > 0 ? info.dwSize.X : 80;
+#else
+    struct winsize size;
+
+    if (!isatty(STDERR_FILENO))
+        return 0;
+    return ioctl(STDERR_FILENO, TIOCGWINSZ, &size) == 0 && size.ws_col > 0 ? size.ws_col : 80;
 #endif
 }
 
@@ -654,6 +829,8 @@ static void x25519_ref(uint8_t q[32], const uint8_t n[32], const uint8_t p[32])
     secure_zero(b, sizeof(gf));
     secure_zero(c, sizeof(gf));
     secure_zero(d, sizeof(gf));
+    secure_zero(e, sizeof(gf));
+    secure_zero(f, sizeof(gf));
 }
 
 /* CRC-32 as used by Ethernet and zlib: reflected, init and final XOR all ones. */
@@ -1244,124 +1421,799 @@ static int curve_init(void)
 }
 
 /* ======================================================================== */
-/* 7. Target patterns                                                        */
+/* 7. Targets: what a key has to look like                                   */
 /* ======================================================================== */
 
+/*
+ * The Meshtastic apps show a key as two strings:
+ *
+ *   node ID      "!" and 8 hex digits: the CRC-32 of the public key
+ *   public key   43 base64 characters and a closing "=", or 64 hex digits
+ *
+ * A pattern says, for some positions of one of these strings, which symbols
+ * are acceptable there.  A target is one or two patterns that a single key
+ * must satisfy; every target of a run is given its own key.
+ *
+ * Pattern syntax, the same for every string:
+ *   0-9 a-z ...  the character itself
+ *   .            any one character
+ *   *            any run of characters, at most once: "dead*" (or plain
+ *                "dead") is "starts with", "*beef" is "ends with", and
+ *                "de*ef" is both
+ *   ?d ?l ?u     a digit, a lower-case letter, an upper-case letter
+ *   ?h ?H        one of 0-9a-f, one of 0-9A-F
+ *   ?s           + or /
+ *   ?a           any one character
+ * The ?x forms are the built-in charsets of hashcat masks, and as there a ?
+ * always takes the next character with it.  Hex has no case, so in the two
+ * hex strings ?l and ?u both mean a letter a-f.
+ */
+
+enum { FORM_ID, FORM_KEY, FORM_KEYHEX, FORM_COUNT };
+
 typedef struct {
-    uint32_t mask;                  /* 0xF in every fixed hex digit            */
-    uint32_t value[MAX_TARGETS];
-    int      count;
-    int      fixed_digits;
-    uint64_t bitmap[1024];          /* 65536-bit prefilter for target lists    */
+    const char *tag;                /* introduces the pattern on the command line */
+    const char *noun;
+    const char *alphabet;           /* symbol value -> character                  */
+    unsigned    bits;               /* per symbol                                 */
+    unsigned    length;             /* symbols in the whole string                */
+    int         caseless;           /* a letter stands for both of its cases      */
+} form_t;
+
+static const form_t FORMS[FORM_COUNT] = {
+    {"id:",     "node ID",          HEX_ALPHABET,    4, 8,  1},
+    {"key:",    "public key",       BASE64_ALPHABET, 6, 43, 0},
+    {"keyhex:", "public key (hex)", HEX_ALPHABET,    4, 64, 1},
+};
+
+typedef struct {
+    uint8_t  pos;                   /* position in the string            */
+    uint64_t allowed;               /* bit v set: symbol v is acceptable */
+} rule_t;
+
+#define PATTERN_TEXT 160
+
+typedef struct {
+    int      form;
+    unsigned count;                 /* rules; 0: the pattern is absent   */
+    rule_t   rule[64];
+    char     text[PATTERN_TEXT];    /* canonical spelling, for display   */
 } pattern_t;
 
-static pattern_t g_pat;
+#define TARGET_TEXT (2 * PATTERN_TEXT + 64)
+
+typedef struct {
+    pattern_t id, key;
+    uint32_t  id_mask, id_value;            /* node-ID bits all matches have in common   */
+    uint64_t  key_mask[4], key_value[4];    /* the same for the public key, word by word */
+    double    chance;                       /* that a random key matches                 */
+    char      text[TARGET_TEXT];            /* "node ID !dead* + public key Mesh*"       */
+    uint64_t  wanted, found;                /* keys; found is guarded by the output lock */
+    uint32_t  first_id;                     /* node ID of its first key, for the summary */
+} target_t;
+
+static target_t g_target[MAX_TARGETS];
+static int      g_targets;
 
 /* The firmware reserves node numbers below 4 and the broadcast address. */
+static const uint32_t RESERVED_IDS[] = {0, 1, 2, 3, 0xffffffffu};
+
 static inline int node_id_reserved(uint32_t id)
 {
     return id < 4u || id == 0xffffffffu;
 }
 
-static inline uint32_t pattern_slot(uint32_t masked)
+/*
+ * Which bit of the underlying number carries bit s of the symbol at a
+ * position: a bit of the 32-bit node ID, or bit n of the public key read as
+ * a 256-bit little-endian integer (bit n of the key is bit n % 64 of word
+ * n / 64 and bit n % 8 of byte n / 8).  -1 for the two padding bits base64
+ * appends to 256 bits of data.
+ */
+static int form_bit(int form, unsigned pos, unsigned s)
 {
-    return (masked * 0x9e3779b1u) >> 16;
-}
-
-static inline int pattern_match(uint32_t id)
-{
-    const uint32_t m = id & g_pat.mask;
-
-    if (g_pat.count == 1) {
-        if (LIKELY(m != g_pat.value[0]))
-            return 0;
-    } else {
-        const uint32_t s = pattern_slot(m);
-        int found = 0;
-        if (LIKELY(!((g_pat.bitmap[s >> 6] >> (s & 63)) & 1)))
-            return 0;
-        for (int k = 0; k < g_pat.count; k++)
-            found |= (m == g_pat.value[k]);
-        if (!found)
-            return 0;
+    switch (form) {
+    case FORM_ID:
+        return (int)(28 - 4 * pos + s);
+    case FORM_KEYHEX:                   /* two digits per byte, the high one first */
+        return (int)(8 * (pos / 2) + (pos % 2 ? 0u : 4u) + s);
+    default: {                          /* the bytes' bits, high bit first, six at a time */
+        const unsigned n = 6 * pos + 5 - s;
+        return n < 256 ? (int)(8 * (n / 8) + 7 - n % 8) : -1;
     }
-    return !node_id_reserved(id);
-}
-
-/* A pattern that can never match: used by the benchmark and the self-tests. */
-static void pattern_set_none(void)
-{
-    memset(&g_pat, 0, sizeof g_pat);
-    g_pat.mask = 0xffffffffu;
-    g_pat.value[0] = 0xffffffffu;   /* matches only the reserved broadcast id */
-    g_pat.count = 1;
-    g_pat.fixed_digits = 8;
+    }
 }
 
 /*
- * Parse "dead", "!c0de", "dc80*a", "dead,beef,cafe" into g_pat.
- * Returns NULL on success or a message describing what is wrong.
+ * The symbols that can occur at a position at all.  Bit 255 of a public key
+ * is always clear and base64 padding is zero, so the last characters of a
+ * key string cannot take every value.
  */
-static const char *pattern_parse(const char *text)
+static uint64_t form_possible(int form, unsigned pos)
 {
-    const char *p = text;
-    int have_mask = 0;
+    const unsigned bits = FORMS[form].bits;
+    uint64_t set = 0;
 
-    memset(&g_pat, 0, sizeof g_pat);
-    for (;;) {
-        uint32_t mask = 0, value = 0;
-        int digits = 0, duplicate = 0;
+    for (unsigned v = 0; v < (1u << bits); v++) {
+        int ok = 1;
+        for (unsigned s = 0; s < bits; s++) {
+            const int b = form_bit(form, pos, s);
+            if (((v >> s) & 1) && form != FORM_ID && (b < 0 || b == 255))
+                ok = 0;
+        }
+        if (ok)
+            set |= (uint64_t)1 << v;
+    }
+    return set;
+}
 
-        if (*p == '!')
-            p++;
-        for (; *p != '\0' && *p != ','; p++, digits++) {
-            const int shift = 28 - 4 * digits;
-            const int d = hex_digit(*p);
-            if (digits >= 8)
-                return "a target has at most 8 hex digits";
-            if (d >= 0) {
-                mask |= (uint32_t)0xf << shift;
-                value |= (uint32_t)d << shift;
-            } else if (strchr("*?.xX", *p) == NULL) {
-                return "use hex digits 0-9 a-f, and * ? . or x for \"any digit\"";
+/* The symbol a character stands for, or -1. */
+static int form_symbol(int form, char c)
+{
+    const form_t *f = &FORMS[form];
+
+    for (unsigned v = 0; f->alphabet[v] != '\0'; v++)
+        if (f->alphabet[v] == c || (f->caseless && f->alphabet[v] == ascii_lower(c)))
+            return (int)v;
+    return -1;
+}
+
+/* The symbol at a position of a public key's string. */
+static inline unsigned key_symbol(int form, const uint8_t pk[32], unsigned pos)
+{
+    if (form == FORM_KEYHEX)
+        return (pk[pos / 2] >> (pos % 2 ? 0 : 4)) & 15u;
+    {
+        const unsigned n = 6 * pos, byte = n / 8;
+        const unsigned next = byte + 1 < 32 ? (unsigned)pk[byte + 1] : 0u;
+        const unsigned two = ((unsigned)pk[byte] << 8) | next;
+        return (two >> (10 - n % 8)) & 63u;
+    }
+}
+
+static int pattern_matches_key(const pattern_t *p, const uint8_t pk[32])
+{
+    for (unsigned i = 0; i < p->count; i++)
+        if (!((p->rule[i].allowed >> key_symbol(p->form, pk, p->rule[i].pos)) & 1))
+            return 0;
+    return 1;
+}
+
+static int pattern_matches_id(const pattern_t *p, uint32_t id)
+{
+    for (unsigned i = 0; i < p->count; i++)
+        if (!((p->rule[i].allowed >> ((id >> (28 - 4 * p->rule[i].pos)) & 15u)) & 1))
+            return 0;
+    return 1;
+}
+
+/* Does this key belong to the target?  A key with a reserved node ID belongs to none. */
+static int target_matches(const target_t *t, const uint8_t pk[32], uint32_t id)
+{
+    return pattern_matches_key(&t->key, pk) && pattern_matches_id(&t->id, id) &&
+           !node_id_reserved(id);
+}
+
+/* ---- parsing ---- */
+
+static char g_parse_error[320];
+
+PRINTF_LIKE(1, 2)
+static const char *parse_error(const char *fmt, ...)
+{
+    va_list ap;
+
+    va_start(ap, fmt);
+    vsnprintf(g_parse_error, sizeof g_parse_error, fmt, ap);
+    va_end(ap);
+    return g_parse_error;
+}
+
+/* hashcat's built-in charsets, as far as they make sense for these strings */
+static const struct {
+    char        letter;
+    const char *chars;
+} CLASSES[] = {
+    {'d', "0123456789"},
+    {'l', "abcdefghijklmnopqrstuvwxyz"},
+    {'u', "ABCDEFGHIJKLMNOPQRSTUVWXYZ"},
+    {'h', "0123456789abcdef"},
+    {'H', "0123456789ABCDEF"},
+    {'s', "+/"},
+};
+
+/* If `letter` names a class, store its symbols for this form (possibly none) and return 1. */
+static int class_set(int form, char letter, uint64_t *set)
+{
+    if (letter == 'a') {
+        *set = FORMS[form].bits == 6 ? ~(uint64_t)0 : 0xffffu;
+        return 1;
+    }
+    for (size_t k = 0; k < ARRAY_LEN(CLASSES); k++) {
+        if (CLASSES[k].letter != letter)
+            continue;
+        *set = 0;
+        for (const char *c = CLASSES[k].chars; *c != '\0'; c++) {
+            const int v = form_symbol(form, *c);
+            if (v >= 0)
+                *set |= (uint64_t)1 << v;
+        }
+        return 1;
+    }
+    return 0;
+}
+
+/* "'e' cannot be character 43 of the 43 in a public key: that one is always one of ..." */
+static const char *pattern_impossible(int form, unsigned pos, uint64_t possible, const char *what)
+{
+    const form_t *f = &FORMS[form];
+    char list[65];
+    size_t n = 0;
+
+    for (unsigned v = 0; f->alphabet[v] != '\0'; v++)
+        if ((possible >> v) & 1)
+            list[n++] = f->alphabet[v];
+    list[n] = '\0';
+    return parse_error("'%s' cannot be character %u of the %u in a %s: that one is always one "
+                       "of %s", what, pos + 1, f->length, f->noun, list);
+}
+
+#define NO_STAR 0xffffu
+
+/*
+ * Parse the n characters at s as a pattern for one string.  Returns NULL on
+ * success or a message saying what is wrong.
+ */
+static const char *pattern_parse(pattern_t *p, int form, const char *s, size_t n, int ignore_case)
+{
+    const form_t *f = &FORMS[form];
+    const uint64_t every = f->bits == 6 ? ~(uint64_t)0 : 0xffffu;
+    uint64_t tok[64];                   /* the symbols each character of the pattern accepts */
+    char tok_text[64][3];               /* and how it was written, for messages              */
+    char shown[PATTERN_TEXT - 16];      /* at most 2 * 64 + 2 characters and the terminator  */
+    size_t used = 0, i = 0;
+    unsigned count = 0, star = NO_STAR, prefix;
+    int closed = 0, folded = 0;
+
+    memset(p, 0, sizeof *p);
+    p->form = form;
+    if (form == FORM_ID) {
+        shown[used++] = '!';
+        if (n > 0 && s[0] == '!')
+            i = 1;
+    }
+
+    for (; i < n; i++) {
+        const char c = s[i];
+        uint64_t set;
+
+        if (closed)
+            return parse_error("nothing can follow the '=' that ends a public key");
+        if (c == '*') {
+            if (star != NO_STAR)
+                return parse_error("a pattern can hold only one *");
+            star = count;
+            shown[used++] = '*';
+            continue;
+        }
+        if (c == '=' && form == FORM_KEY) {
+            closed = 1;
+            continue;
+        }
+        if (count == f->length)
+            return parse_error("too long: a %s has %u characters", f->noun, f->length);
+
+        if (c == '?') {
+            if (i + 1 == n || !class_set(form, s[i + 1], &set))
+                return parse_error("a ? needs one of d l u h H s a after it, as in ?d for a "
+                                   "digit; use . for any one character");
+            if (set == 0)
+                return parse_error("?%c matches nothing in a %s", s[i + 1], f->noun);
+            shown[used++] = '?';
+            shown[used++] = s[++i];
+            memcpy(tok_text[count], shown + used - 2, 2);
+            tok_text[count][2] = '\0';
+        } else if (c == '.') {
+            set = every;
+            shown[used++] = '.';
+        } else {
+            const int v = form_symbol(form, c);
+            if (v < 0) {
+                if (form == FORM_ID)
+                    return parse_error("'%c' is not a hex digit: a node ID pattern uses 0-9, a-f "
+                                       "and . for any digit (a public-key pattern starts with "
+                                       "key:)", c);
+                return parse_error("'%c' cannot occur in a %s", c, f->noun);
             }
+            set = (uint64_t)1 << v;
+            if (ignore_case && !f->caseless) {
+                const int other = form_symbol(form, ascii_swap_case(c));
+                if (other >= 0 && other != v) {
+                    set |= (uint64_t)1 << other;
+                    folded = 1;
+                }
+            }
+            shown[used++] = f->caseless ? f->alphabet[v] : c;
         }
-        if (digits == 0)
-            return "empty target";
-        if (mask == 0)
-            return "a target needs at least one fixed digit";
-        if (have_mask && mask != g_pat.mask)
-            return "every target in a list must fix the same digit positions";
-        if (mask == 0xffffffffu && node_id_reserved(value))
-            return "that node ID is reserved by the firmware (!00000000-!00000003, !ffffffff)";
-        g_pat.mask = mask;
-        have_mask = 1;
-
-        for (int k = 0; k < g_pat.count; k++)
-            duplicate |= (g_pat.value[k] == value);
-        if (!duplicate) {
-            if (g_pat.count == MAX_TARGETS)
-                return "too many targets (the limit is 64)";
-            g_pat.value[g_pat.count++] = value;
+        if (c != '?') {
+            tok_text[count][0] = shown[used - 1];
+            tok_text[count][1] = '\0';
         }
-        if (*p == '\0')
-            break;
-        p++;                        /* skip the comma */
+        tok[count++] = set;
     }
 
-    for (uint32_t m = g_pat.mask; m != 0; m >>= 4)
-        g_pat.fixed_digits += (m & 15) != 0;
-    for (int k = 0; k < g_pat.count; k++) {
-        const uint32_t s = pattern_slot(g_pat.value[k]);
-        g_pat.bitmap[s >> 6] |= (uint64_t)1 << (s & 63);
+    if (count == 0)
+        return parse_error("a %s pattern needs at least one character", f->noun);
+    if (star == NO_STAR) {
+        if (closed && count != f->length)
+            return parse_error("'=' is where a public key ends: put a * in front "
+                               "(key:*%.*s) to match the end", (int)n, s);
+        if (count < f->length)
+            shown[used++] = '*';        /* a short pattern is a prefix */
+        prefix = count;
+    } else {
+        prefix = star;
     }
+    if (form == FORM_KEY && (count == f->length || prefix < count))
+        shown[used++] = '=';            /* the pattern reaches the end of the key */
+    shown[used] = '\0';
+
+    /* characters before the * count from the start, those after it from the end */
+    for (unsigned k = 0; k < count; k++) {
+        const unsigned pos = k < prefix ? k : f->length - (count - k);
+        const uint64_t possible = form_possible(form, pos);
+        const uint64_t allowed = tok[k] & possible;
+
+        if (allowed == 0)
+            return pattern_impossible(form, pos, possible, tok_text[k]);
+        if (allowed != possible) {
+            p->rule[p->count].pos = (uint8_t)pos;
+            p->rule[p->count].allowed = allowed;
+            p->count++;
+        }
+    }
+    if (p->count == 0)
+        return parse_error("a %s pattern must pin down at least one character", f->noun);
+
+    snprintf(p->text, sizeof p->text, "%s%s", shown, folded ? " (any case)" : "");
     return NULL;
 }
 
-/* Average number of keys that must be tried per hit. */
-static double pattern_expected_keys(void)
+/* Which form's tag begins the n characters at s; -1 if none does. */
+static int tag_form(const char *s, size_t n, size_t *len)
 {
-    return pow(16.0, g_pat.fixed_digits) / g_pat.count;
+    for (int form = 0; form < FORM_COUNT; form++) {
+        const char *tag = FORMS[form].tag;
+        const size_t t = strlen(tag);
+        size_t k = 0;
+
+        if (n < t)
+            continue;
+        while (k < t && ascii_lower(s[k]) == tag[k])
+            k++;
+        if (k == t) {
+            *len = t;
+            return form;
+        }
+    }
+    return -1;
+}
+
+/* The bits on which every symbol of a rule agrees, and their values. */
+static void rule_common(unsigned bits, const rule_t *r, unsigned *mask, unsigned *value)
+{
+    unsigned all_and = (1u << bits) - 1, all_or = 0;
+
+    for (unsigned v = 0; v < (1u << bits); v++) {
+        if ((r->allowed >> v) & 1) {
+            all_and &= v;
+            all_or |= v;
+        }
+    }
+    *mask = ~(all_and ^ all_or) & ((1u << bits) - 1);
+    *value = all_and & *mask;
+}
+
+/* Derive everything the search needs from a target's two patterns. */
+static const char *target_finish(target_t *t)
+{
+    char text[TARGET_TEXT];
+    double ids = 1.0;
+    unsigned size[8];
+
+    /* the bits all matching keys share: the kernels filter on these */
+    for (unsigned i = 0; i < t->id.count; i++) {
+        unsigned mask, value;
+        rule_common(4, &t->id.rule[i], &mask, &value);
+        for (unsigned s = 0; s < 4; s++) {
+            const int b = form_bit(FORM_ID, t->id.rule[i].pos, s);
+            if ((mask >> s) & 1) {
+                t->id_mask |= (uint32_t)1 << b;
+                t->id_value |= (uint32_t)((value >> s) & 1) << b;
+            }
+        }
+    }
+    for (unsigned i = 0; i < t->key.count; i++) {
+        const unsigned bits = FORMS[t->key.form].bits;
+        unsigned mask, value;
+        rule_common(bits, &t->key.rule[i], &mask, &value);
+        for (unsigned s = 0; s < bits; s++) {
+            const int b = form_bit(t->key.form, t->key.rule[i].pos, s);
+            if (((mask >> s) & 1) && b >= 0) {
+                t->key_mask[b / 64] |= (uint64_t)1 << (b % 64);
+                t->key_value[b / 64] |= (uint64_t)((value >> s) & 1) << (b % 64);
+            }
+        }
+    }
+
+    /* the node IDs the pattern accepts, less the reserved ones among them */
+    for (unsigned pos = 0; pos < 8; pos++)
+        size[pos] = 16;
+    for (unsigned i = 0; i < t->id.count; i++)
+        size[t->id.rule[i].pos] = (unsigned)__builtin_popcountll(t->id.rule[i].allowed);
+    for (unsigned pos = 0; pos < 8; pos++)
+        ids *= size[pos];
+    for (size_t r = 0; r < ARRAY_LEN(RESERVED_IDS); r++)
+        ids -= pattern_matches_id(&t->id, RESERVED_IDS[r]);
+    if (ids <= 0.0)
+        return parse_error("that node ID is reserved by the firmware "
+                           "(!00000000 to !00000003 and !ffffffff)");
+    t->chance = ids / 4294967296.0;
+    for (unsigned i = 0; i < t->key.count; i++) {
+        const uint64_t possible = form_possible(t->key.form, t->key.rule[i].pos);
+        t->chance *= (double)__builtin_popcountll(t->key.rule[i].allowed) /
+                     (double)__builtin_popcountll(possible);
+    }
+
+    /* composed in a buffer of its own: the pieces live in the same structure as the result */
+    if (t->id.count != 0 && t->key.count != 0)
+        snprintf(text, sizeof text, "%s %s + %s %s", FORMS[FORM_ID].noun, t->id.text,
+                 FORMS[t->key.form].noun, t->key.text);
+    else if (t->id.count != 0)
+        snprintf(text, sizeof text, "%s %s", FORMS[FORM_ID].noun, t->id.text);
+    else
+        snprintf(text, sizeof text, "%s %s", FORMS[t->key.form].noun, t->key.text);
+    memcpy(t->text, text, strlen(text) + 1);
+    return NULL;
+}
+
+/*
+ * Parse one target: "dead", "id:*beef", "key:Mesh", "id:c0de+key:Me?d".  An
+ * untagged pattern is a node ID.  Returns NULL or a message.
+ */
+static const char *target_parse(target_t *t, const char *s, size_t n, int ignore_case)
+{
+    size_t start = 0;
+
+    memset(t, 0, sizeof *t);
+    for (;;) {
+        size_t end = start, taglen = 0, unused;
+        const char *err;
+        pattern_t *p;
+        int form;
+
+        /* a pattern runs up to a '+' that is followed by another tagged pattern */
+        while (end < n && !(s[end] == '+' && tag_form(s + end + 1, n - end - 1, &unused) >= 0))
+            end++;
+        form = tag_form(s + start, end - start, &taglen);
+        if (form < 0) {
+            form = FORM_ID;
+            taglen = 0;
+        }
+        p = form == FORM_ID ? &t->id : &t->key;
+        if (p->count != 0)
+            return parse_error("a target takes one node ID pattern and one public key pattern");
+        err = pattern_parse(p, form, s + start + taglen, end - start - taglen, ignore_case);
+        if (err != NULL)
+            return err;
+        if (end == n)
+            break;
+        start = end + 1;
+    }
+    return target_finish(t);
+}
+
+static void targets_clear(void)
+{
+    g_targets = 0;
+}
+
+/*
+ * Add the targets of one command-line argument: patterns separated by commas.
+ * The Windows command prompt does not treat single quotes as quotes, so an
+ * argument that arrives wrapped in them is taken without them.
+ */
+static const char *targets_add(const char *arg, int ignore_case)
+{
+    const char *p = arg, *end = arg + strlen(arg);
+
+    if (end - p >= 2 && p[0] == '\'' && end[-1] == '\'') {
+        p++;
+        end--;
+    }
+    for (;;) {
+        const char *comma = memchr(p, ',', (size_t)(end - p));
+        const size_t n = (size_t)((comma != NULL ? comma : end) - p);
+        const char *err;
+
+        if (n == 0)
+            return parse_error("empty target");
+        if (g_targets == MAX_TARGETS)
+            return parse_error("too many targets (the limit is %d)", MAX_TARGETS);
+        err = target_parse(&g_target[g_targets], p, n, ignore_case);
+        if (err != NULL)
+            return err;
+        g_targets++;
+        if (comma == NULL)
+            return NULL;
+        p = comma + 1;
+    }
+}
+
+/* Ask for `each` keys per target; returns how many keys that is in all. */
+static uint64_t targets_want(uint64_t each)
+{
+    for (int k = 0; k < g_targets; k++) {
+        g_target[k].wanted = each;
+        g_target[k].found = 0;
+        g_target[k].first_id = 0;
+    }
+    return each * (uint64_t)g_targets;
+}
+
+/*
+ * The average number of keys that must be tried until every target has all
+ * the keys it still wants.  Reads `found`: the caller holds the output lock
+ * or no worker is running.
+ *
+ * A target that wants k more keys at chance c is treated as one event of
+ * rate c / k; the wait for all targets is then the maximum of independent
+ * exponentials, whose mean is the integral of 1 - prod(1 - exp(-r_i x)).
+ * It is evaluated on a geometric grid, since the rates can differ by many
+ * orders of magnitude.
+ */
+static double targets_expected_keys(void)
+{
+    double rate[MAX_TARGETS], lo = 0.0, hi = 0.0, total = 0.0, x, last;
+    const double step = 1.01;
+    int n = 0;
+
+    for (int k = 0; k < g_targets; k++) {
+        const target_t *t = &g_target[k];
+        if (t->found >= t->wanted)
+            continue;
+        rate[n] = t->chance / (double)(t->wanted - t->found);
+        lo = n == 0 || rate[n] < lo ? rate[n] : lo;
+        hi = n == 0 || rate[n] > hi ? rate[n] : hi;
+        n++;
+    }
+    if (n == 0)
+        return 0.0;
+    if (n == 1)
+        return 1.0 / rate[0];
+
+    x = 1e-6 / hi;                      /* below this the integrand is 1 */
+    total = x;
+    last = 1.0;
+    while (x < 60.0 / lo) {
+        const double next = x * step;
+        double all = 1.0, now;
+        for (int i = 0; i < n; i++)
+            all *= -expm1(-rate[i] * next);
+        now = 1.0 - all;
+        total += 0.5 * (last + now) * (next - x);
+        last = now;
+        x = next;
+    }
+    return total;
+}
+
+/* ---- the filter the kernels apply to every key ---- */
+
+/*
+ * Examining every target exactly for every key would cost more than making
+ * the key, so the kernels first apply a cheap necessary condition.  Each
+ * target contributes the bits that all of its matches share inside one
+ * 64-bit quantity, a word of the public key or the node ID; targets that
+ * look at the same bits form a group, and a group is tested with a single
+ * comparison or a single hashed look-up.  Only keys that pass a group are
+ * examined exactly.
+ *
+ * A node ID costs a CRC-32 per key.  When no group reads it the kernels skip
+ * that work, and the CRC is computed just for the keys that get through.
+ *
+ * A filter never changes once it is published.  When a target has all its
+ * keys a new filter without it is published, and the old one stays valid
+ * until the run is over, so the kernels need no lock: they pick up the
+ * current filter once per window.
+ */
+#define SRC_ID            4         /* sources 0..3 are the words of the public key */
+#define FILTER_HASH_BITS  12
+#define FILTER_SLOTS      (1u << FILTER_HASH_BITS)
+
+typedef struct {
+    uint64_t mask;                  /* the bits of the source this group looks at   */
+    uint64_t value;                 /* what they must equal, for a group of one     */
+    uint8_t  source;
+    uint8_t  single;
+    uint16_t first, count;          /* its targets: member[first .. first + count)  */
+    uint64_t bitmap[FILTER_SLOTS / 64];     /* hashed values of a larger group      */
+} fgroup_t;
+
+typedef struct {
+    unsigned groups;
+    int      need_id;               /* some group reads the node ID                 */
+    fgroup_t group[MAX_TARGETS];
+    uint8_t  member[MAX_TARGETS];           /* target numbers, group by group       */
+    uint64_t member_value[MAX_TARGETS];     /* the masked source of that target     */
+} filter_t;
+
+/*
+ * Wants no key, yet costs exactly what a search for one node ID costs: the
+ * benchmark and the self-tests run under it.  Its group has no members, so a
+ * key that happens to pass is dropped at once.
+ */
+static const filter_t FILTER_NONE = {
+    .groups = 1,
+    .need_id = 1,
+    .group = {{.mask = 0xffffffffu, .value = 0xffffffffu, .source = SRC_ID, .single = 1}},
+};
+
+static _Atomic(const filter_t *) g_filter = &FILTER_NONE;
+
+static struct {
+    filter_t *version[MAX_TARGETS + 1];     /* every filter published during this run */
+    int       versions;
+} g_filters;
+
+static ALWAYS_INLINE const filter_t *filter_current(void)
+{
+    return atomic_load_explicit(&g_filter, memory_order_acquire);
+}
+
+static ALWAYS_INLINE unsigned filter_slot(uint64_t masked)
+{
+    return (unsigned)((masked * 0x9e3779b97f4a7c15ULL) >> (64 - FILTER_HASH_BITS));
+}
+
+static ALWAYS_INLINE int fgroup_pass(const fgroup_t *g, uint64_t source)
+{
+    const uint64_t v = source & g->mask;
+
+    if (g->single)
+        return v == g->value;
+    {
+        const unsigned slot = filter_slot(v);
+        return (int)((g->bitmap[slot >> 6] >> (slot & 63)) & 1);
+    }
+}
+
+/* May the key with these words (and this node ID, if the filter reads one) be wanted? */
+static ALWAYS_INLINE int filter_pass(const filter_t *f, const uint64_t w[4], uint32_t id)
+{
+    for (unsigned g = 0; g < f->groups; g++) {
+        const fgroup_t *grp = &f->group[g];
+        if (fgroup_pass(grp, grp->source == SRC_ID ? (uint64_t)id : w[grp->source]))
+            return 1;
+    }
+    return 0;
+}
+
+/* Build the filter for the targets that still want keys. */
+static void filter_build(filter_t *f)
+{
+    struct {
+        int active, word, key_bits, id_bits, use_id;
+        unsigned group;
+    } c[MAX_TARGETS];
+    unsigned next[MAX_TARGETS];
+    int need_id = 0;
+
+    memset(f, 0, sizeof *f);
+    memset(c, 0, sizeof c);
+
+    /*
+     * Which quantity should each target be filtered on?  A key word is free;
+     * the node ID is worth its CRC only for a target that has no public-key
+     * pattern, or one too loose to stop most keys.  Once some target needs
+     * the ID anyway, every target uses whichever of its two filters is the
+     * tighter.
+     */
+    for (int k = 0; k < g_targets; k++) {
+        const target_t *t = &g_target[k];
+
+        if (t->found >= t->wanted)
+            continue;
+        c[k].active = 1;
+        for (int w = 1; w < 4; w++)
+            if (__builtin_popcountll(t->key_mask[w]) > __builtin_popcountll(t->key_mask[c[k].word]))
+                c[k].word = w;
+        c[k].key_bits = __builtin_popcountll(t->key_mask[c[k].word]);
+        c[k].id_bits = __builtin_popcount(t->id_mask);
+        c[k].use_id = t->id.count != 0 && (t->key.count == 0 || c[k].key_bits < 6);
+        need_id |= c[k].use_id;
+    }
+    for (int k = 0; k < g_targets && need_id; k++) {
+        const target_t *t = &g_target[k];
+        if (c[k].active && t->id.count != 0 && t->key.count != 0)
+            c[k].use_id = c[k].id_bits > c[k].key_bits;
+    }
+    need_id = 0;                        /* that may have left no group reading the ID */
+    for (int k = 0; k < g_targets; k++)
+        need_id |= c[k].active && c[k].use_id;
+    f->need_id = need_id;
+
+    /* targets with the same source and mask share a group */
+    for (int k = 0; k < g_targets; k++) {
+        const target_t *t = &g_target[k];
+        uint64_t mask;
+        uint8_t source;
+        unsigned g = 0;
+
+        if (!c[k].active)
+            continue;
+        source = c[k].use_id ? SRC_ID : (uint8_t)c[k].word;
+        mask = c[k].use_id ? t->id_mask : t->key_mask[c[k].word];
+        while (g < f->groups && !(f->group[g].source == source && f->group[g].mask == mask))
+            g++;
+        if (g == f->groups) {
+            f->group[g].source = source;
+            f->group[g].mask = mask;
+            f->groups++;
+        }
+        f->group[g].count++;
+        c[k].group = g;
+    }
+
+    /* lay the members out group by group */
+    for (unsigned g = 0, at = 0; g < f->groups; g++) {
+        f->group[g].first = (uint16_t)at;
+        next[g] = at;
+        at += f->group[g].count;
+    }
+    for (int k = 0; k < g_targets; k++) {
+        const target_t *t = &g_target[k];
+        if (!c[k].active)
+            continue;
+        f->member[next[c[k].group]] = (uint8_t)k;
+        f->member_value[next[c[k].group]] = c[k].use_id ? t->id_value : t->key_value[c[k].word];
+        next[c[k].group]++;
+    }
+    for (unsigned g = 0; g < f->groups; g++) {
+        fgroup_t *grp = &f->group[g];
+        grp->single = grp->count == 1;
+        grp->value = f->member_value[grp->first];
+        for (unsigned m = grp->first; m < (unsigned)grp->first + grp->count; m++) {
+            const unsigned slot = filter_slot(f->member_value[m]);
+            grp->bitmap[slot >> 6] |= (uint64_t)1 << (slot & 63);
+        }
+    }
+}
+
+/* Back to the filter that matches nothing.  No worker may be running. */
+static void filter_reset(void)
+{
+    atomic_store(&g_filter, &FILTER_NONE);
+    for (int i = 0; i < g_filters.versions; i++)
+        xfree_aligned(g_filters.version[i]);
+    g_filters.versions = 0;
+}
+
+/*
+ * Build a filter for the targets still wanted and hand it to the kernels.
+ * The caller holds the output lock, or no worker is running.  At most one
+ * filter is published per finished target, plus the first.
+ */
+static void filter_publish(void)
+{
+    filter_t *f;
+
+    if (g_filters.versions == (int)ARRAY_LEN(g_filters.version))
+        die("internal error: more filters than targets");
+    f = (filter_t *)xalloc_aligned(sizeof *f);
+    filter_build(f);
+    g_filters.version[g_filters.versions++] = f;
+    atomic_store_explicit(&g_filter, f, memory_order_release);
 }
 
 /* ======================================================================== */
@@ -1384,73 +2236,119 @@ typedef struct {
     uint8_t  secret[32];
     uint8_t  public_key[32];
     uint32_t node_id;
+    int      target;                /* the target this key was found for       */
 } hit_t;
 
 typedef enum { OUT_TEXT, OUT_JSON, OUT_CAPTURE } out_mode_t;
 
 static struct {
     out_mode_t  mode;
-    uint64_t    hits_wanted;
+    uint64_t    hits_wanted;        /* over all targets                        */
     uint64_t    hits;               /* guarded by the output lock              */
     hit_t      *capture;            /* OUT_CAPTURE: array of hits_wanted slots */
     int         progress_width;     /* columns of the progress line shown, or 0 */
+    int         output_failed;      /* stdout refused a key; guarded by the lock */
     atomic_int  stop;
     atomic_ullong faults;           /* fast-path results the reference refused */
 } g_run;
 
 static volatile sig_atomic_t g_interrupted;
 
-#define PROGRESS_COLUMNS 79         /* widest progress line: never wraps at 80 */
+#define PROGRESS_COLUMNS     100    /* no progress line is wider than this              */
+#define PROGRESS_LOG_SECONDS 10.0   /* until the first progress line in a log (see below) */
+#define PROGRESS_LOG_SLOWEST 3600.0 /* and the longest wait between two of them           */
 
 /*
- * Hand a whole progress update to the terminal in one write.  Some C
- * libraries send formatted output on an unbuffered stream one character at
- * a time, and a terminal then shows the line being redrawn left to right.
- * stderr is unbuffered, so going around stdio cannot reorder anything.
+ * The widest line that can be redrawn in place right now; less than 1 when
+ * stderr is not a terminal.  Three columns of the terminal stay free: two
+ * for the ^C that a terminal prints behind the line on Ctrl-C, and the last
+ * one, because a character there makes some terminals move on to the next
+ * row, and a line that has wrapped can no longer be redrawn or erased.
  */
-static void progress_write(const char *text, size_t n)
+static int progress_limit(void)
 {
-#ifdef _WIN32
-    (void)_write(_fileno(stderr), text, (unsigned)n);
-#else
-    if (write(STDERR_FILENO, text, n) < 0) {
-        /* progress is decoration: nothing to do if the terminal is gone */
-    }
-#endif
+    const int room = os_stderr_columns() - 3;
+
+    return room < PROGRESS_COLUMNS ? room : PROGRESS_COLUMNS;
 }
 
-/* Draw LINE over the progress line, padded so it also covers a longer one. */
-static void progress_draw(const char *line)
-{
-    char out[PROGRESS_COLUMNS + 2];
-    int width = (int)strlen(line);
+/*
+ * A progress line is put together from pieces, the most important first.
+ * A piece that does not fit is left out with all that follow it, so that a
+ * narrow terminal shows a shorter line and not one cut off in mid-word.
+ */
+typedef struct {
+    char text[PROGRESS_COLUMNS + 1];
+    int  limit;                     /* columns there are to fill            */
+    int  closed;                    /* a piece did not fit: nothing follows */
+} status_t;
 
-    if (width > PROGRESS_COLUMNS)
-        width = PROGRESS_COLUMNS;
-    if (width > g_run.progress_width)
+PRINTF_LIKE(2, 3)
+static void status_add(status_t *st, const char *fmt, ...)
+{
+    char piece[PROGRESS_COLUMNS + 1];
+    const int used = (int)strlen(st->text);
+    const int room = (st->limit < PROGRESS_COLUMNS ? st->limit : PROGRESS_COLUMNS) - used;
+    va_list ap;
+    int n;
+
+    va_start(ap, fmt);
+    n = vsnprintf(piece, sizeof piece, fmt, ap);
+    va_end(ap);
+    if (st->closed || n < 0 || n > room) {
+        st->closed = 1;
+        return;
+    }
+    memcpy(st->text + used, piece, (size_t)n + 1);
+}
+
+/*
+ * Draw a line, made for the width the terminal has now, over the progress
+ * line: in one write, and padded so that it also covers a longer line drawn
+ * before.  The caller of this and of progress_clear holds the output lock
+ * or is the only thread writing.
+ */
+static void progress_draw(const status_t *line)
+{
+    char out[PROGRESS_COLUMNS + 1];
+    const int width = (int)strlen(line->text);
+
+    if (line->limit < 1)
+        return;
+    if (g_run.progress_width > line->limit)
+        g_run.progress_width = line->limit;     /* the window has become narrower */
+    if (g_run.progress_width < width)
         g_run.progress_width = width;
     out[0] = '\r';
     memset(out + 1, ' ', (size_t)g_run.progress_width);
-    memcpy(out + 1, line, (size_t)width);
-    progress_write(out, (size_t)g_run.progress_width + 1);
+    memcpy(out + 1, line->text, (size_t)width);
+    (void)os_write(TO_STDERR, out, (size_t)g_run.progress_width + 1);
 }
 
 /*
  * Erase the progress line, if one is showing, over its full width so that
- * nothing of it is left behind whatever is printed next.  The caller of
- * either function holds the output lock or is the only thread writing.
+ * nothing of it is left behind whatever is printed next.  After Ctrl-C that
+ * includes the ^C which the terminal has put behind it.
  */
 static void progress_clear(void)
 {
-    char out[PROGRESS_COLUMNS + 2];
+    char out[PROGRESS_COLUMNS + 4];
+    const int limit = progress_limit();
+    int width = g_run.progress_width;
 
-    if (g_run.progress_width > 0) {
-        out[0] = '\r';
-        memset(out + 1, ' ', (size_t)g_run.progress_width);
-        out[g_run.progress_width + 1] = '\r';
-        progress_write(out, (size_t)g_run.progress_width + 2);
-    }
     g_run.progress_width = 0;
+    if (limit < 1)
+        return;
+    if (width > limit)
+        width = limit;
+    if (g_interrupted)
+        width += 2;
+    if (width == 0)
+        return;
+    out[0] = '\r';
+    memset(out + 1, ' ', (size_t)width);
+    out[width + 1] = '\r';
+    (void)os_write(TO_STDERR, out, (size_t)width + 2);
 }
 
 static void on_interrupt(int sig)
@@ -1504,65 +2402,141 @@ static void lane_seed(lane_t *lane, mpoint *centre)
     secure_zero(k, sizeof k);
 }
 
+/* Print one key as its own block: a header naming the target, then the key. */
 static void print_hit(uint64_t number, const hit_t *h)
 {
-    char sk_hex[65], pk_hex[65], sk_b64[45], pk_b64[45];
+    char sk_hex[65], pk_hex[65], sk_b64[45], pk_b64[45], which[32] = "";
+    char block[2048];
+    int n;
 
     hex_encode(sk_hex, h->secret, 32);
     hex_encode(pk_hex, h->public_key, 32);
     base64_encode(sk_b64, h->secret, 32);
     base64_encode(pk_b64, h->public_key, 32);
 
-    progress_clear();
     if (g_run.mode == OUT_JSON) {
-        printf("{\"node_id\":\"!%08" PRIx32 "\",\"node_num\":%" PRIu32 ","
-               "\"private_key_hex\":\"%s\",\"private_key_base64\":\"%s\","
-               "\"public_key_hex\":\"%s\",\"public_key_base64\":\"%s\","
-               "\"command\":\"meshtastic --set security.private_key \\\"base64:%s\\\"\"}\n",
-               h->node_id, h->node_id, sk_hex, sk_b64, pk_hex, pk_b64, sk_b64);
+        n = snprintf(block, sizeof block,
+                     "{\"target\":%d,\"pattern\":\"%s\","
+                     "\"node_id\":\"!%08" PRIx32 "\",\"node_num\":%" PRIu32 ","
+                     "\"private_key_hex\":\"%s\",\"private_key_base64\":\"%s\","
+                     "\"public_key_hex\":\"%s\",\"public_key_base64\":\"%s\","
+                     "\"command\":\"meshtastic --set security.private_key \\\"base64:%s\\\"\"}\n",
+                     h->target + 1, g_target[h->target].text, h->node_id, h->node_id,
+                     sk_hex, sk_b64, pk_hex, pk_b64, sk_b64);
     } else {
-        printf("hit %" PRIu64 ": node id !%08" PRIx32 "\n"
-               "  private key (hex):    %s\n"
-               "  private key (base64): %s\n"
-               "  public key (hex):     %s\n"
-               "  public key (base64):  %s\n"
-               "  install with:         meshtastic --set security.private_key \"base64:%s\"\n",
-               number, h->node_id, sk_hex, sk_b64, pk_hex, pk_b64, sk_b64);
+        if (g_targets > 1)
+            snprintf(which, sizeof which, " | target %d", h->target + 1);
+        n = snprintf(block, sizeof block,
+                     "==== key %" PRIu64 " of %" PRIu64 "%s | %s ====\n"
+                     "  node ID:              !%08" PRIx32 "\n"
+                     "  public key (base64):  %s\n"
+                     "  public key (hex):     %s\n"
+                     "  private key (base64): %s\n"
+                     "  private key (hex):    %s\n"
+                     "  install with:         meshtastic --set security.private_key \"base64:%s\"\n"
+                     "\n",
+                     number, g_run.hits_wanted, which, g_target[h->target].text, h->node_id,
+                     pk_b64, pk_hex, sk_b64, sk_hex, sk_b64);
     }
-    fflush(stdout);
+
+    /*
+     * One write for the whole block, so that it appears at once and unbroken.
+     * A key goes nowhere else: if stdout does not take it, it is lost, and
+     * the caller ends the search.
+     */
+    progress_clear();
+    if (n < 0 || (size_t)n >= sizeof block || os_write(TO_STDOUT, block, (size_t)n) != 0)
+        g_run.output_failed = 1;
+    secure_zero(block, sizeof block);
     secure_zero(sk_hex, sizeof sk_hex);
     secure_zero(sk_b64, sizeof sk_b64);
 }
 
 /*
- * The fast path says candidate j of this lane has node ID fast_id and that it
- * matches.  Recompute everything independently; only a confirmed key is
- * reported.  Always returns 1: the lane's base is finished either way.
+ * The fast path says candidate j of this lane has public key fast_pk and node
+ * ID fast_id, and that a target wants it.  Recompute everything
+ * independently; only a confirmed key is reported.  Always returns 1: the
+ * lane's base is finished either way.
  */
-static NOINLINE int engine_on_match(const lane_t *lane, unsigned j, uint32_t fast_id)
+static NOINLINE int engine_verify(const lane_t *lane, unsigned j, const uint8_t fast_pk[32],
+                                  uint32_t fast_id)
 {
     hit_t h;
 
     scalar_offset(h.secret, lane->base, lane->win * WINDOW + j);
     x25519_ref(h.public_key, h.secret, BASE_U);
     h.node_id = crc32_ref(h.public_key, 32);
+    h.target = -1;
 
-    if (h.node_id != fast_id || !pattern_match(h.node_id)) {
+    if (memcmp(h.public_key, fast_pk, 32) != 0 || h.node_id != fast_id) {
         atomic_fetch_add(&g_run.faults, 1);
     } else {
         output_lock();
-        if (g_run.hits < g_run.hits_wanted) {
+        /*
+         * One key serves one target.  If several that still want a key accept
+         * this one, it goes to the hardest to please: a key for "dead" must
+         * not be spent on "de".
+         */
+        for (int k = 0; k < g_targets; k++)
+            if (g_target[k].found < g_target[k].wanted &&
+                target_matches(&g_target[k], h.public_key, h.node_id) &&
+                (h.target < 0 || g_target[k].chance < g_target[h.target].chance))
+                h.target = k;
+        if (h.target >= 0 && !g_run.output_failed) {
+            target_t *t = &g_target[h.target];
+
             if (g_run.mode == OUT_CAPTURE)
                 g_run.capture[g_run.hits] = h;
             else
                 print_hit(g_run.hits + 1, &h);
-            if (++g_run.hits == g_run.hits_wanted)
-                atomic_store(&g_run.stop, 1);
+            if (g_run.output_failed) {
+                atomic_store(&g_run.stop, 1);   /* this key is lost; the next would be too */
+            } else {
+                if (t->found == 0)
+                    t->first_id = h.node_id;
+                if (++t->found == t->wanted)
+                    filter_publish();           /* the kernels stop looking for it */
+                if (++g_run.hits == g_run.hits_wanted)
+                    atomic_store(&g_run.stop, 1);
+            }
         }
         output_unlock();
     }
     secure_zero(&h, sizeof h);
     return 1;
+}
+
+/*
+ * A kernel's filter let candidate j of a lane through.  `words` is the public
+ * key the kernel computed, and `id` its node ID if the kernel computed one.
+ * Decide exactly, on those values, whether a target of the filter wants the
+ * key; if so, send it to the reference check.  Returns 1 if the lane's base
+ * must be retired, 0 if the filter merely let through a key nobody wants.
+ */
+static NOINLINE int engine_candidate(const filter_t *f, const lane_t *lane, unsigned j,
+                                     const uint64_t words[4], int have_id, uint32_t id)
+{
+    uint8_t pk[32];
+    int wanted = 0;
+
+    words_to_bytes(pk, words);
+    for (unsigned g = 0; g < f->groups && !wanted; g++) {
+        const fgroup_t *grp = &f->group[g];
+        const uint64_t v = (grp->source == SRC_ID ? (uint64_t)id : words[grp->source]) & grp->mask;
+
+        for (unsigned m = grp->first; m < (unsigned)grp->first + grp->count && !wanted; m++) {
+            const target_t *t = &g_target[f->member[m]];
+
+            if (f->member_value[m] != v || !pattern_matches_key(&t->key, pk))
+                continue;
+            if (!have_id) {                     /* the kernel skipped the CRC; this key needs it */
+                crc_msgs((const uint64_t (*)[4])(const void *)words, &id, 1);
+                have_id = 1;
+            }
+            wanted = pattern_matches_id(&t->id, id) && !node_id_reserved(id);
+        }
+    }
+    return wanted ? engine_verify(lane, j, pk, id) : 0;
 }
 
 /* What a kernel records for the self-test instead of (as well as) matching. */
@@ -1623,9 +2597,11 @@ static void walk1_window(void *state, const walk_dump *dump)
     walk1_t *w = (walk1_t *)state;
     lane_t *lane = &w->lane[0];
     fe *prefix = w->prefix;
+    const filter_t *const f = filter_current();
+    const int want_id = f->need_id || dump != NULL;
     fe e0, e, d, acc, inv, t, lam;
     uint64_t msg[2][4];
-    uint32_t id[2];
+    uint32_t id[2] = {0, 0};
     int retired = 0;
 
     /*
@@ -1665,7 +2641,8 @@ static void walk1_window(void *state, const walk_dump *dump)
         fe_mul(&lam, &t, &inv);
         fe_sq_add_to_words(msg[1], &lam, &e);       /* M - P_i */
 
-        crc_msgs((const uint64_t (*)[4])msg, id, 2);
+        if (want_id)
+            crc_msgs((const uint64_t (*)[4])msg, id, 2);
 
         if (UNLIKELY(dump != NULL)) {
             memcpy(dump->words[HALF_WINDOW + i], msg[0], 32);
@@ -1673,21 +2650,24 @@ static void walk1_window(void *state, const walk_dump *dump)
             dump->id[HALF_WINDOW + i] = id[0];
             dump->id[HALF_WINDOW - i] = id[1];
         }
-        if (UNLIKELY(pattern_match(id[0])) && !retired)
-            retired = engine_on_match(lane, (unsigned)(HALF_WINDOW + i), id[0]);
-        if (UNLIKELY(pattern_match(id[1])) && !retired)
-            retired = engine_on_match(lane, (unsigned)(HALF_WINDOW - i), id[1]);
+        if (UNLIKELY(filter_pass(f, msg[0], id[0])) && !retired)
+            retired = engine_candidate(f, lane, (unsigned)(HALF_WINDOW + i), msg[0], want_id,
+                                       id[0]);
+        if (UNLIKELY(filter_pass(f, msg[1], id[1])) && !retired)
+            retired = engine_candidate(f, lane, (unsigned)(HALF_WINDOW - i), msg[1], want_id,
+                                       id[1]);
     }
 
     /* The centre itself. */
     fe_to_words(msg[0], &w->um);
-    crc_msgs((const uint64_t (*)[4])msg, id, 1);
+    if (want_id)
+        crc_msgs((const uint64_t (*)[4])msg, id, 1);
     if (UNLIKELY(dump != NULL)) {
         memcpy(dump->words[HALF_WINDOW], msg[0], 32);
         dump->id[HALF_WINDOW] = id[0];
     }
-    if (UNLIKELY(pattern_match(id[0])) && !retired)
-        retired = engine_on_match(lane, HALF_WINDOW, id[0]);
+    if (UNLIKELY(filter_pass(f, msg[0], id[0])) && !retired)
+        retired = engine_candidate(f, lane, HALF_WINDOW, msg[0], want_id, id[0]);
 
     if (retired || lane->win + 1 >= LANE_MAX_WINDOWS) {
         walk1_seed(w);
@@ -2216,14 +3196,71 @@ static void walk4_seed(void *state)
         walk4_seed_lane((walk4_t *)state, l);
 }
 
-/* A lane reports at most one key per base: later matches in the window are dropped. */
-static NOINLINE void walk4_on_match(walk4_t *w, unsigned *retired, unsigned l, unsigned j,
-                                    uint32_t id)
+/*
+ * The filter on eight keys at once: bit n of the result is set if key n may
+ * be wanted, where keys 0..3 are the lanes of grp[0] and keys 4..7 those of
+ * grp[1].  A group of one target is a vector comparison; a larger group
+ * falls back to one look-up per key.
+ */
+AVX2_INLINE unsigned filter8(const filter_t *f, const uint64_t (*grp)[4][4], const uint32_t *id)
 {
-    if (*retired & (1u << l))
-        return;
-    engine_on_match(&w->lane[l], j, id);
-    *retired |= 1u << l;
+    unsigned hit = 0;
+
+    for (unsigned g = 0; g < f->groups; g++) {
+        const fgroup_t *fg = &f->group[g];
+
+        if (fg->source == SRC_ID) {
+            if (fg->single) {
+                const __m256i v = V4_AND(_mm256_loadu_si256((const __m256i *)(const void *)id),
+                                         _mm256_set1_epi32((int)(uint32_t)fg->mask));
+                hit |= (unsigned)_mm256_movemask_ps(_mm256_castsi256_ps(
+                    _mm256_cmpeq_epi32(v, _mm256_set1_epi32((int)(uint32_t)fg->value))));
+            } else {
+                for (unsigned n = 0; n < 8; n++)
+                    hit |= (unsigned)fgroup_pass(fg, id[n]) << n;
+            }
+        } else {
+            const unsigned k = fg->source;
+
+            if (fg->single) {
+                const __m256i m = V4_SET1(fg->mask), want = V4_SET1(fg->value);
+                const __m256i a = _mm256_loadu_si256((const __m256i *)(const void *)grp[0][k]);
+                const __m256i b = _mm256_loadu_si256((const __m256i *)(const void *)grp[1][k]);
+                hit |= (unsigned)_mm256_movemask_pd(_mm256_castsi256_pd(
+                           _mm256_cmpeq_epi64(V4_AND(a, m), want))) |
+                       (unsigned)_mm256_movemask_pd(_mm256_castsi256_pd(
+                           _mm256_cmpeq_epi64(V4_AND(b, m), want))) << 4;
+            } else {
+                for (unsigned n = 0; n < 8; n++)
+                    hit |= (unsigned)fgroup_pass(fg, grp[n >> 2][k][n & 3]) << n;
+            }
+        }
+    }
+    return hit;
+}
+
+/*
+ * Follow up the keys the filter let through: bit n of `hit` is lane n & 3 of
+ * grp[n >> 2], which holds candidate j_first or j_second of its lane.  A lane
+ * reports at most one key per base, so once it is retired its later
+ * candidates in the window are dropped.
+ */
+static NOINLINE void walk4_candidates(walk4_t *w, const filter_t *f, unsigned *retired,
+                                      unsigned hit, const uint64_t (*grp)[4][4],
+                                      const uint32_t *id, int have_id, unsigned j_first,
+                                      unsigned j_second)
+{
+    for (unsigned n = 0; n < 8; n++) {
+        const unsigned l = n & 3, g = n >> 2;
+        uint64_t words[4];
+
+        if (!((hit >> n) & 1) || (*retired & (1u << l)))
+            continue;
+        for (int k = 0; k < 4; k++)
+            words[k] = grp[g][k][l];
+        if (engine_candidate(f, &w->lane[l], g == 0 ? j_first : j_second, words, have_id, id[n]))
+            *retired |= 1u << l;
+    }
 }
 
 static NOINLINE void walk4_dump(const walk_dump *dump, const uint64_t grp[4][4],
@@ -2239,11 +3276,13 @@ static NOINLINE void walk4_dump(const walk_dump *dump, const uint64_t grp[4][4],
 AVX2_FN static void walk4_window(void *state, const walk_dump *dump)
 {
     walk4_t *w = (walk4_t *)state;
+    const filter_t *const f = filter_current();
+    const int want_id = f->need_id || dump != NULL;
     fe4 um, vm, bias_u, bias_v, e0, e, p, g19, acc, inv, d, t, lam, x, ui, vi, pre;
     __m256i words[4];
     _Alignas(32) uint64_t grp[2][4][4];
-    _Alignas(32) uint32_t id[8];
-    unsigned retired;
+    _Alignas(32) uint32_t id[8] = {0};
+    unsigned retired, hit;
 
     /*
      * Window constants, all with non-negative limbs:
@@ -2311,30 +3350,31 @@ AVX2_FN static void walk4_window(void *state, const walk_dump *dump)
         for (int k = 0; k < 4; k++)
             _mm256_storeu_si256((__m256i *)(void *)grp[1][k], words[k]);
 
-        crc_groups((const uint64_t (*)[4][4])grp, id, 2);
+        if (want_id)
+            crc_groups((const uint64_t (*)[4][4])grp, id, 2);
 
         if (UNLIKELY(dump != NULL)) {
             walk4_dump(dump, (const uint64_t (*)[4])grp[0], id, (unsigned)(HALF_WINDOW + i));
             walk4_dump(dump, (const uint64_t (*)[4])grp[1], id + 4, (unsigned)(HALF_WINDOW - i));
         }
-        for (unsigned n = 0; n < 8; n++) {
-            if (UNLIKELY(pattern_match(id[n])))
-                walk4_on_match(w, &retired, n & 3,
-                               (unsigned)(n < 4 ? HALF_WINDOW + i : HALF_WINDOW - i), id[n]);
-        }
+        hit = filter8(f, (const uint64_t (*)[4][4])grp, id);
+        if (UNLIKELY(hit != 0))
+            walk4_candidates(w, f, &retired, hit, (const uint64_t (*)[4][4])grp, id, want_id,
+                             (unsigned)(HALF_WINDOW + i), (unsigned)(HALF_WINDOW - i));
     }
 
     /* The centres themselves. */
     fe4_to_words(words, &um);
     for (int k = 0; k < 4; k++)
         _mm256_storeu_si256((__m256i *)(void *)grp[0][k], words[k]);
-    crc_groups((const uint64_t (*)[4][4])grp, id, 1);
+    if (want_id)
+        crc_groups((const uint64_t (*)[4][4])grp, id, 1);
     if (UNLIKELY(dump != NULL))
         walk4_dump(dump, (const uint64_t (*)[4])grp[0], id, HALF_WINDOW);
-    for (unsigned n = 0; n < 4; n++) {
-        if (UNLIKELY(pattern_match(id[n])))
-            walk4_on_match(w, &retired, n, HALF_WINDOW, id[n]);
-    }
+    hit = filter8(f, (const uint64_t (*)[4][4])grp, id) & 0xfu;    /* grp[1] is stale here */
+    if (UNLIKELY(hit != 0))
+        walk4_candidates(w, f, &retired, hit, (const uint64_t (*)[4][4])grp, id, want_id,
+                         HALF_WINDOW, HALF_WINDOW);
 
     /* Move every centre: M' = M + Q, with acc = 1 / (u_Q - u_M). */
     fe4_broadcast(&ui, TAB4Q.u);
@@ -2400,6 +3440,8 @@ typedef struct {
 static worker_t g_workers[MAX_THREADS];
 
 #define CALIBRATION_SECONDS 0.03
+#define LONG_SEARCH_SECONDS 86400.0         /* worth a warning */
+#define SLOW_TERMINAL_SECONDS 0.1           /* for one status line: worth a remark */
 
 /* Search with one kernel until `seconds` have passed (0: until told to stop). */
 static double worker_search(worker_t *wk, const backend_t *be, double seconds)
@@ -2416,6 +3458,7 @@ static double worker_search(worker_t *wk, const backend_t *be, double seconds)
         be->window(state, NULL);
         atomic_fetch_add_explicit(&wk->keys, per_window, memory_order_relaxed);
         done += per_window;
+        os_yield();
         if (seconds > 0.0 && (elapsed = now_seconds() - start) >= seconds)
             break;
     }
@@ -2458,10 +3501,15 @@ static void worker_main(void *arg)
 /* A key count for people: "65.5 thousand", "1.72 billion". */
 static void format_count(char *out, size_t n, double count)
 {
-    static const char *const unit[] = {"", " thousand", " million", " billion", " trillion"};
+    static const char *const unit[] = {"", " thousand", " million", " billion", " trillion",
+                                       " quadrillion", " quintillion"};
     size_t u = 0;
     double v = count;
 
+    if (count >= 0.9995e21) {               /* beyond words */
+        snprintf(out, n, "%.3g", count);
+        return;
+    }
     while (v >= 999.5 && u + 1 < ARRAY_LEN(unit)) {
         v /= 1e3;
         u++;
@@ -2472,6 +3520,8 @@ static void format_count(char *out, size_t n, double count)
         snprintf(out, n, "%.*f%s", v < 9.995 ? 2 : v < 99.95 ? 1 : 0, v, unit[u]);
 }
 
+#define SECONDS_PER_YEAR 31557600.0
+
 static void format_duration(char *out, size_t n, double seconds)
 {
     if (seconds < 1.0)
@@ -2480,8 +3530,14 @@ static void format_duration(char *out, size_t n, double seconds)
         snprintf(out, n, "%.1f s", seconds);
     else if (seconds < 7200.0)
         snprintf(out, n, "%.1f min", seconds / 60.0);
-    else
+    else if (seconds < 172800.0)
         snprintf(out, n, "%.1f h", seconds / 3600.0);
+    else if (seconds < 2.0 * SECONDS_PER_YEAR)
+        snprintf(out, n, "%.0f days", seconds / 86400.0);
+    else if (seconds < 1e6 * SECONDS_PER_YEAR)
+        snprintf(out, n, "%.0f years", seconds / SECONDS_PER_YEAR);
+    else
+        snprintf(out, n, "%.2g years", seconds / SECONDS_PER_YEAR);
 }
 
 typedef struct {
@@ -2489,6 +3545,7 @@ typedef struct {
     double seconds;
     int threads;
     char kernels[64];                       /* e.g. "avx2 x16, scalar x16" */
+    double terminal_wait;                   /* the longest handing over one status line took */
 } run_result;
 
 /*
@@ -2499,13 +3556,20 @@ typedef struct {
 static run_result engine_run(const backend_t *be, int nthreads, int pin, double time_limit,
                              unsigned long long key_limit, int show_progress)
 {
-    run_result res = {0, 0.0, 0, ""};
-    const double expected = pattern_expected_keys();
-    double start, last_report;
+    run_result res = {0, 0.0, 0, "", 0.0};
+    /* on a terminal one line is redrawn in place; a file or a pipe gets a line now and then */
+    const int live = show_progress && os_stderr_columns() > 0;
+    double expected = 0.0, start, last_report, log_at = PROGRESS_LOG_SECONDS;
+    uint64_t estimated_at = UINT64_MAX;     /* g_run.hits when `expected` was worked out */
+    int warned = 0;
 
     atomic_store(&g_run.stop, 0);
     g_run.hits = 0;
     g_run.progress_width = 0;
+    g_run.output_failed = 0;
+    filter_reset();
+    if (g_targets > 0)
+        filter_publish();
 
     for (int i = 0; i < nthreads; i++) {
         worker_t *wk = &g_workers[i];
@@ -2540,20 +3604,69 @@ static run_result engine_run(const backend_t *be, int nthreads, int pin, double 
         if (atomic_load(&g_run.stop))
             break;
 
-        if (show_progress && now - last_report >= 1.0) {
+        if (show_progress && now - last_report >= 1.0 && res.keys > 0) {
             const double rate = (double)res.keys / res.seconds;
-            char line[PROGRESS_COLUMNS + 1], count[32], mean[32], p95[32];
+            status_t line = {"", live ? progress_limit() : PROGRESS_COLUMNS, 0};
+            double waited = now_seconds() - now;    /* for the terminal to say how wide it is */
+            char count[40], mean[40], p95[40];
+
             format_count(count, sizeof count, (double)res.keys);
-            format_duration(mean, sizeof mean, expected / rate);
-            format_duration(p95, sizeof p95, 3.0 * expected / rate);
-            /* cut off at the buffer on purpose: a progress line must not wrap */
-            if (snprintf(line, sizeof line,
-                         "%s keys, %.1f M/s, %.0f%% likely by now (avg %s, 95%% by %s)",
-                         count, rate / 1e6,
-                         100.0 * (1.0 - exp(-(double)res.keys / expected)), mean, p95) < 0)
-                line[0] = '\0';
             output_lock();
-            progress_draw(line);
+            if (g_run.hits != estimated_at) {       /* a key was found: the outlook changed */
+                estimated_at = g_run.hits;
+                expected = targets_expected_keys();
+            }
+            format_duration(mean, sizeof mean, expected / rate);
+            if (g_run.hits_wanted != 1)
+                status_add(&line, "%" PRIu64 " of %" PRIu64 " found", g_run.hits,
+                           g_run.hits_wanted);
+            status_add(&line, "%s%s keys", line.text[0] != '\0' ? ", " : "", count);
+            status_add(&line, ", %.1f M/s", rate / 1e6);
+            if (g_run.hits_wanted != 1) {
+                status_add(&line, ", about %s more on average", mean);
+            } else if (expected / rate > LONG_SEARCH_SECONDS) {
+                status_add(&line, ", average wait %s", mean);
+            } else {
+                format_duration(p95, sizeof p95, 3.0 * expected / rate);
+                status_add(&line, ", %.0f%% likely by now",
+                           100.0 * (1.0 - exp(-(double)res.keys / expected)));
+                status_add(&line, ", avg %s", mean);
+                status_add(&line, ", 95%% by %s", p95);
+            }
+            if (!warned && expected / rate > LONG_SEARCH_SECONDS) {
+                char longest[40], whose[32] = "the search";
+                double most = 0.0;
+                int hard = 0;                       /* the target that needs the most work */
+
+                for (int k = 0; k < g_targets; k++) {
+                    const target_t *t = &g_target[k];
+                    const double work = t->found < t->wanted
+                                            ? (double)(t->wanted - t->found) / t->chance : 0.0;
+                    if (work > most) {
+                        most = work;
+                        hard = k;
+                    }
+                }
+                if (g_targets > 1)
+                    snprintf(whose, sizeof whose, "target %d alone", hard + 1);
+                format_duration(longest, sizeof longest, most / rate);
+                warned = 1;
+                progress_clear();
+                err_printf("note: at this speed %s takes about %s on average.\n"
+                           "      Each character less makes it 16 times (hex) or 64 times "
+                           "(base64) shorter.\n", whose, longest);
+            }
+            if (live) {
+                const double before = now_seconds();
+                progress_draw(&line);
+                waited += now_seconds() - before;
+                if (waited > res.terminal_wait)
+                    res.terminal_wait = waited;
+            } else if (res.seconds >= log_at) {
+                /* a log is not the place for a line a second: wait twice as long each time */
+                err_printf("%s\n", line.text);
+                log_at += log_at < PROGRESS_LOG_SLOWEST ? log_at : PROGRESS_LOG_SLOWEST;
+            }
             output_unlock();
             last_report = now;
         }
@@ -2566,6 +3679,7 @@ static run_result engine_run(const backend_t *be, int nthreads, int pin, double 
         res.keys += atomic_load(&g_workers[i].keys);
     res.seconds = now_seconds() - start;
     progress_clear();
+    filter_reset();
 
     for (size_t b = 0; b < ARRAY_LEN(BACKENDS); b++) {
         int n = 0;
@@ -2587,8 +3701,10 @@ static run_result engine_run(const backend_t *be, int nthreads, int pin, double 
 static int t_failures;
 static int t_verbose;
 
+PRINTF_LIKE(2, 3)
 static void t_check(int ok, const char *fmt, ...)
 {
+    char what[256];
     va_list ap;
 
     if (!ok)
@@ -2596,10 +3712,9 @@ static void t_check(int ok, const char *fmt, ...)
     if (!t_verbose && ok)
         return;
     va_start(ap, fmt);
-    printf("  %s  ", ok ? "ok  " : "FAIL");
-    vprintf(fmt, ap);
-    printf("\n");
+    vsnprintf(what, sizeof what, fmt, ap);
     va_end(ap);
+    out_printf("  %s  %s\n", ok ? "ok  " : "FAIL", what);
 }
 
 static void t_x25519(const char *name, const char *k_hex, const char *u_hex, const char *want_hex)
@@ -2831,30 +3946,483 @@ static void test_crc(int full)
     }
 }
 
-static void test_pattern(void)
+/* ---- targets and the filter ---- */
+
+/*
+ * The tests' own reading of a pattern, applied to the string a person would
+ * compare by eye.  It shares nothing with the parser or the matcher above.
+ */
+static int t_class(char letter, char c, int hex)
 {
-    static const char *const good[] = {"a", "dead", "!c0de", "DC80*a", "dead,beef,cafe",
-                                       "!dead,!beef", "deadbeef", "????beef", "0000000?", "dead,dead"};
-    static const char *const bad[] = {"", "!", "g", "dead,", "dead,abc", "123456789", "****",
-                                      "00000000", "00000003", "ffffffff", "dead beef"};
-    const pattern_t saved = g_pat;
-    int wrong = 0;
+    switch (letter) {
+    case 'd': return c >= '0' && c <= '9';
+    case 'l': return hex ? c >= 'a' && c <= 'f' : c >= 'a' && c <= 'z';
+    case 'u': return hex ? c >= 'a' && c <= 'f' : c >= 'A' && c <= 'Z';
+    case 'h': return (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f');
+    case 'H': return (c >= '0' && c <= '9') || (hex ? c >= 'a' && c <= 'f' : c >= 'A' && c <= 'F');
+    case 's': return c == '+' || c == '/';
+    default:  return 1;                         /* ?a */
+    }
+}
 
+static int t_glob(const char *pat, const char *str, int hex, int fold)
+{
+    if (*pat == '\0')
+        return *str == '\0';
+    if (*pat == '*') {
+        for (;; str++) {
+            if (t_glob(pat + 1, str, hex, fold))
+                return 1;
+            if (*str == '\0')
+                return 0;
+        }
+    }
+    if (*str == '\0')
+        return 0;
+    if (pat[0] == '?' && pat[1] != '\0' && strchr("adluhHs", pat[1]) != NULL)
+        return t_class(pat[1], *str, hex) && t_glob(pat + 2, str + 1, hex, fold);
+    if (*pat == '.')
+        return t_glob(pat + 1, str + 1, hex, fold);
+    if (hex || fold ? ascii_lower(*pat) != ascii_lower(*str) : *pat != *str)
+        return 0;
+    return t_glob(pat + 1, str + 1, hex, fold);
+}
+
+/* Does a key satisfy string-level patterns for its three strings (NULL: anything)? */
+static int t_expect(const uint8_t pk[32], uint32_t id, const char *id_glob, const char *key_glob,
+                    const char *hex_glob, int fold)
+{
+    char id_str[9], b64[45], hex[65];
+
+    snprintf(id_str, sizeof id_str, "%08" PRIx32, id);
+    base64_encode(b64, pk, 32);
+    hex_encode(hex, pk, 32);
+    return (id_glob == NULL || t_glob(id_glob, id_str, 1, 0)) &&
+           (key_glob == NULL || t_glob(key_glob, b64, 0, fold)) &&
+           (hex_glob == NULL || t_glob(hex_glob, hex, 1, 0)) && !(id < 4u || id == 0xffffffffu);
+}
+
+/* A random public-key encoding (bit 255 clear) and a random node ID. */
+static void t_random_key(uint8_t pk[32], uint32_t *id)
+{
+    uint8_t r[4];
+
+    os_random(pk, 32);
+    pk[31] &= 127;
+    os_random(r, sizeof r);
+    *id = (uint32_t)r[0] | (uint32_t)r[1] << 8 | (uint32_t)r[2] << 16 | (uint32_t)r[3] << 24;
+}
+
+/* The n-th (from 0, wrapping) symbol of a set. */
+static unsigned t_pick(uint64_t set, unsigned n)
+{
+    n %= (unsigned)__builtin_popcountll(set);
+    for (unsigned v = 0;; v++)
+        if (((set >> v) & 1) && n-- == 0)
+            return v;
+}
+
+/* Bend a key and node ID until they fit a target, choosing at random where it leaves a choice. */
+static void t_plant(const target_t *t, uint8_t pk[32], uint32_t *id)
+{
+    uint8_t choice[2][64];
+
+    os_random(choice, sizeof choice);
+    for (unsigned i = 0; i < t->id.count; i++) {
+        const unsigned v = t_pick(t->id.rule[i].allowed, choice[0][i]);
+        for (unsigned s = 0; s < 4; s++) {
+            const int b = form_bit(FORM_ID, t->id.rule[i].pos, s);
+            *id = (*id & ~((uint32_t)1 << b)) | (uint32_t)((v >> s) & 1) << b;
+        }
+    }
+    for (unsigned i = 0; i < t->key.count; i++) {
+        const unsigned v = t_pick(t->key.rule[i].allowed, choice[1][i]);
+        for (unsigned s = 0; s < FORMS[t->key.form].bits; s++) {
+            const int b = form_bit(t->key.form, t->key.rule[i].pos, s);
+            if (b >= 0)
+                pk[b / 8] = (uint8_t)((pk[b / 8] & ~(1u << (b % 8))) | ((v >> s) & 1) << (b % 8));
+        }
+    }
+}
+
+static void t_words(uint64_t w[4], const uint8_t pk[32])
+{
+    for (int k = 0; k < 4; k++)
+        w[k] = load64_le(pk + 8 * k);
+}
+
+/* Parse one specification into the global target list; returns 1 if it was accepted. */
+static int t_targets(const char *spec, int ignore_case)
+{
+    targets_clear();
+    return targets_add(spec, ignore_case) == NULL;
+}
+
+static void test_targets(int full)
+{
+    static const char *const good[] = {
+        "a", "dead", "!c0de", "DC80*a", "dead,beef,cafe", "!dead,!beef", "deadbeef", "....beef",
+        "0000000.", "dead,dead", "dead,abc", "id:dead", "ID:*beef", "id:de*ef", "id:d..d.00d",
+        "id:?d?d?d?d?d?d?d?d", "0000000?d", "fffffff?l", "?a?hbe?H?a", "key:Mesh", "KEY:Mesh",
+        "key:*Radio=", "key:*8", "key:Me*gQ=", "key:?u?l?d?s", "key:a+b", "key:Me.",
+        "keyhex:c0ffee", "keyhex:*7f", "keyhex:?h?d", "id:dead+key:Me", "key:Me+id:dead",
+        "dead+keyhex:00", "id:c0+key:a+b",
+    };
+    static const char *const bad[] = {
+        "", "!", "g", "dead,", ",dead", "123456789", "****", "*", "....", "id:", "key:", "00000000",
+        "00000003", "ffffffff", "dead beef", "id:?s", "id:de*ad*", "key:Me=", "key:a=b", "key:*a*b",
+        "key:Mesh!", "key:*Node", "key:*e=", "key:*IA", "keyhex:zz", "keyhex:*8f", "keyhex:?s",
+        "id:dead+id:beef", "key:a+keyhex:b", "Mesh", "dead????", "d??d", "dea?", "deadxxxx",
+        "key:Me?", "key:?x", "key:??",
+    };
+    static const struct {
+        const char *spec, *text;
+        int fold;
+    } shown[] = {
+        {"dead", "node ID !dead*", 0},
+        {"dead*", "node ID !dead*", 0},
+        {"!DEAD", "node ID !dead*", 0},
+        {"id:dead", "node ID !dead*", 0},
+        {"*BEEF", "node ID !*beef", 0},
+        {"id:de*ef", "node ID !de*ef", 0},
+        {"deadbeef", "node ID !deadbeef", 0},
+        {"d..d", "node ID !d..d*", 0},
+        {"c0?de", "node ID !c0?de*", 0},
+        {"c0.de", "node ID !c0.de*", 0},
+        {"key:Mesh", "public key Mesh*", 0},
+        {"key:*Q0", "public key *Q0=", 0},
+        {"key:*Q0=", "public key *Q0=", 0},
+        {"key:a*b*", "", 0},
+        {"keyhex:C0FFEE", "public key (hex) c0ffee*", 0},
+        {"id:c0+key:?uA", "node ID !c0* + public key ?uA*", 0},
+        {"key:?uA+id:c0", "node ID !c0* + public key ?uA*", 0},
+        {"key:me", "public key me* (any case)", 1},
+        {"key:42", "public key 42*", 1},
+    };
+    static const struct {
+        const char *spec;
+        double one_in;                  /* 1 / chance */
+    } odds[] = {
+        {"dead", 65536.0},
+        {"deadbeef", 4294967296.0},
+        {"0000000.", 4294967296.0 / 12.0},
+        {"id:?d?d?d?d?d?d?d?d", 4294967296.0 / (1e8 - 4.0)},
+        {"key:M", 64.0 / (1.0 - 5.0 / 4294967296.0)},
+        {"key:*8", 16.0 / (1.0 - 5.0 / 4294967296.0)},
+        {"key:*Q0", 512.0 / (1.0 - 5.0 / 4294967296.0)},
+        {"keyhex:*7f", 128.0 / (1.0 - 5.0 / 4294967296.0)},
+        {"key:?d?d", 4096.0 / 100.0 / (1.0 - 5.0 / 4294967296.0)},
+        {"id:dead+key:M", 65536.0 * 64.0},
+    };
+    /* a specification and what it means for each of the key's strings (NULL: anything) */
+    static const struct {
+        const char *spec;
+        int fold;
+        const char *id, *key, *hex;
+    } cases[] = {
+        {"a", 0, "a*", NULL, NULL},
+        {"!c0", 0, "c0*", NULL, NULL},
+        {"id:*5a", 0, "*5a", NULL, NULL},
+        {"id:d*d", 0, "d*d", NULL, NULL},
+        {"7.e", 0, "7.e*", NULL, NULL},
+        {"id:?d?l*", 0, "?d?l*", NULL, NULL},
+        {"id:*?u?d", 0, "*?u?d", NULL, NULL},
+        {"id:?d?d?d?d?d?d?d?d", 0, "?d?d?d?d?d?d?d?d", NULL, NULL},
+        {"....beef", 0, "....beef", NULL, NULL},
+        {"0000000.", 0, "0000000.", NULL, NULL},
+        {"key:M", 0, NULL, "M*", NULL},
+        {"key:Me*", 0, NULL, "Me*", NULL},
+        {"key:*8=", 0, NULL, "*8=", NULL},
+        {"key:*Q0", 0, NULL, "*Q0=", NULL},
+        {"key:a*w=", 0, NULL, "a*w=", NULL},
+        {"key:?u?l?d?s", 0, NULL, "?u?l?d?s*", NULL},
+        {"key:.?hx", 0, NULL, ".?hx*", NULL},
+        {"key:?H?a.", 0, NULL, "?H*", NULL},
+        {"key:+/", 0, NULL, "+/*", NULL},
+        {"key:me", 1, NULL, "me*", NULL},
+        {"key:*?d?l?u?d", 0, NULL, "*?d?l?u?d=", NULL},
+        {"keyhex:c0", 0, NULL, NULL, "c0*"},
+        {"keyhex:AB", 0, NULL, NULL, "ab*"},
+        {"keyhex:*7f", 0, NULL, NULL, "*7f"},
+        {"keyhex:?d?l*?d", 0, NULL, NULL, "?d?l*?d"},
+        {"id:a+key:b", 0, "a*", "b*", NULL},
+        {"key:b+id:*a", 0, "*a", "b*", NULL},
+        {"d+keyhex:0", 0, "d*", NULL, "0*"},
+    };
+    const int rounds = full ? 4000 : 64;
+    const double two_unequal = 65536.0 + 256.0 - 1.0 / (1.0 / 65536.0 + 1.0 / 256.0);
+    uint64_t seen[2][3];                /* symbols met at the last positions of the key strings */
+    uint64_t possible[2][64];
+    int wrong = 0, bad_symbol = 0, bad_possible = 0, bad_match = 0, bad_mask = 0, vacuous = 0;
+
+    /* the parser */
     for (size_t i = 0; i < ARRAY_LEN(good); i++)
-        wrong += pattern_parse(good[i]) != NULL;
+        wrong += !t_targets(good[i], 0);
     for (size_t i = 0; i < ARRAY_LEN(bad); i++)
-        wrong += pattern_parse(bad[i]) == NULL;
-    t_check(wrong == 0, "patterns: parser accepts and rejects the right forms");
+        wrong += t_targets(bad[i], 0);
+    wrong += !t_targets("dead,beef,cafe", 0) || g_targets != 3;
+    wrong += !t_targets("dead,dead", 0) || g_targets != 2;
+    wrong += !t_targets("'id:*beef,key:Me'", 0) || g_targets != 2 ||
+             strcmp(g_target[0].text, "node ID !*beef") != 0;
+    wrong += t_targets("'dead", 0) || t_targets("''", 0) || t_targets("'", 0);
+    wrong += !t_targets("id:c0+key:a+b", 0) || g_targets != 1 ||
+             strcmp(g_target[0].key.text, "a+b*") != 0;
+    {                                           /* a whole public key, and one character more */
+        char whole[64] = "key:";
+        memset(whole + 4, 'A', 43);
+        strcpy(whole + 47, "=");
+        wrong += !t_targets(whole, 0) || strlen(g_target[0].key.text) != 44;
+        strcpy(whole + 47, "A");
+        wrong += t_targets(whole, 0);
+    }
+    t_check(wrong == 0, "targets: the parser accepts and rejects the right forms");
 
-    wrong = pattern_parse("dc80*a") != NULL;
-    wrong += !pattern_match(0xdc805a49u) || pattern_match(0xdc805b49u) || pattern_match(0xdc815a49u);
-    wrong += g_pat.fixed_digits != 5 || g_pat.count != 1;
-    wrong += pattern_parse("dead,beef,dead") != NULL || g_pat.count != 2;
-    wrong += !pattern_match(0xdead0000u) || !pattern_match(0xbeefffffu) || pattern_match(0xcafe0000u);
-    wrong += pattern_parse("0000000?") != NULL;
-    wrong += pattern_match(0u) || pattern_match(3u) || !pattern_match(4u) || !pattern_match(15u);
-    t_check(wrong == 0, "patterns: matching, wildcards, lists, reserved IDs");
-    g_pat = saved;
+    wrong = 0;
+    for (size_t i = 0; i < ARRAY_LEN(shown); i++) {
+        if (shown[i].text[0] == '\0')
+            wrong += t_targets(shown[i].spec, shown[i].fold);
+        else
+            wrong += !t_targets(shown[i].spec, shown[i].fold) ||
+                     strcmp(g_target[0].text, shown[i].text) != 0;
+    }
+    for (size_t i = 0; i < ARRAY_LEN(odds); i++)
+        wrong += !t_targets(odds[i].spec, 0) ||
+                 fabs(1.0 / g_target[0].chance / odds[i].one_in - 1.0) > 1e-9;
+    t_check(wrong == 0, "targets: canonical spelling and the odds of a match");
+
+    /* how positions of the three strings map to bits of the key and the node ID */
+    memset(seen, 0, sizeof seen);
+    for (int k = 0; k < 2; k++)
+        for (unsigned pos = 0; pos < FORMS[k == 0 ? FORM_KEY : FORM_KEYHEX].length; pos++)
+            possible[k][pos] = form_possible(k == 0 ? FORM_KEY : FORM_KEYHEX, pos);
+    for (int i = 0; i < rounds; i++) {
+        char id_str[9], str[2][65];
+        uint8_t pk[32];
+        uint32_t id;
+
+        t_random_key(pk, &id);
+        snprintf(id_str, sizeof id_str, "%08" PRIx32, id);
+        base64_encode(str[0], pk, 32);
+        hex_encode(str[1], pk, 32);
+        for (unsigned pos = 0; pos < 8; pos++) {
+            unsigned v = 0;
+            for (unsigned s = 0; s < 4; s++)
+                v |= ((id >> form_bit(FORM_ID, pos, s)) & 1u) << s;
+            bad_symbol += HEX_ALPHABET[v] != id_str[pos];
+        }
+        for (int k = 0; k < 2; k++) {
+            const int form = k == 0 ? FORM_KEY : FORM_KEYHEX;
+            const form_t *f = &FORMS[form];
+
+            for (unsigned pos = 0; pos < f->length; pos++) {
+                const unsigned sym = key_symbol(form, pk, pos);
+                unsigned v = 0;
+                for (unsigned s = 0; s < f->bits; s++) {
+                    const int b = form_bit(form, pos, s);
+                    if (b >= 0)
+                        v |= ((unsigned)(pk[b / 8] >> (b % 8)) & 1u) << s;
+                }
+                bad_symbol += v != sym || f->alphabet[sym] != str[k][pos];
+                bad_possible += !((possible[k][pos] >> sym) & 1);
+                if (pos + 3 >= f->length)
+                    seen[k][pos + 3 - f->length] |= (uint64_t)1 << sym;
+            }
+        }
+    }
+    bad_symbol += strlen(BASE64_ALPHABET) != 64 || strlen(HEX_ALPHABET) != 16;
+    /* the full run has seen every symbol that can end a key, and no other */
+    for (int k = 0; k < 2 && full; k++)
+        for (unsigned e = 0; e < 3; e++)
+            bad_possible += seen[k][e] !=
+                            possible[k][FORMS[k == 0 ? FORM_KEY : FORM_KEYHEX].length - 3 + e];
+    bad_possible += __builtin_popcountll(form_possible(FORM_KEY, 42)) != 16 ||
+                    __builtin_popcountll(form_possible(FORM_KEY, 41)) != 32 ||
+                    __builtin_popcountll(form_possible(FORM_KEY, 40)) != 64 ||
+                    __builtin_popcountll(form_possible(FORM_KEYHEX, 62)) != 8 ||
+                    __builtin_popcountll(form_possible(FORM_KEYHEX, 63)) != 16;
+    t_check(bad_symbol == 0, "targets: string positions map to the right bits of key and node ID");
+    t_check(bad_possible == 0, "targets: the characters that can end a public key");
+
+    /* matching, against the tests' own reading of each pattern on the printed strings */
+    for (size_t c = 0; c < ARRAY_LEN(cases); c++) {
+        const target_t *t = &g_target[0];
+        int hits = 0;
+
+        if (!t_targets(cases[c].spec, cases[c].fold) || g_targets != 1) {
+            bad_match++;
+            continue;
+        }
+        for (int i = 0; i < rounds; i++) {
+            uint64_t w[4];
+            uint8_t pk[32];
+            uint32_t id;
+            int got, want;
+
+            t_random_key(pk, &id);
+            if (i & 1)
+                t_plant(t, pk, &id);            /* every other sample is made to fit */
+            got = target_matches(t, pk, id);
+            want = t_expect(pk, id, cases[c].id, cases[c].key, cases[c].hex, cases[c].fold);
+            bad_match += got != want;
+            hits += got;
+            if (got) {
+                t_words(w, pk);
+                bad_mask += (id & t->id_mask) != t->id_value;
+                for (int k = 0; k < 4; k++)
+                    bad_mask += (w[k] & t->key_mask[k]) != t->key_value[k];
+            }
+        }
+        vacuous += hits == 0;
+    }
+    t_check(bad_match == 0 && vacuous == 0,
+            "targets: %d patterns match exactly the keys a reader would expect",
+            (int)ARRAY_LEN(cases));
+    t_check(bad_mask == 0, "targets: the fixed bits of a pattern hold for every match");
+
+    /* the expected work for several targets: harmonic numbers when the odds are equal */
+    wrong = !t_targets("dead", 0);
+    targets_want(1);
+    wrong += fabs(targets_expected_keys() / 65536.0 - 1.0) > 1e-9;
+    targets_want(3);
+    wrong += fabs(targets_expected_keys() / (3.0 * 65536.0) - 1.0) > 1e-9;
+    wrong += !t_targets("dead,beef,cafe,f00d,c0de", 0);
+    targets_want(1);
+    wrong += fabs(targets_expected_keys() / (65536.0 * 137.0 / 60.0) - 1.0) > 1e-3;
+    wrong += !t_targets("dead,ab", 0);          /* 1/a + 1/b - 1/(a + b) */
+    targets_want(1);
+    wrong += fabs(targets_expected_keys() / two_unequal - 1.0) > 1e-3;
+    g_target[1].found = 1;                      /* a finished target no longer counts */
+    wrong += fabs(targets_expected_keys() / 65536.0 - 1.0) > 1e-9;
+    t_check(wrong == 0, "targets: expected work for one and for several targets");
+
+    targets_clear();
+}
+
+/* Is the target among those a filter would have examined for this key? */
+static int t_filter_claims(const filter_t *f, int target, const uint64_t w[4], uint32_t id)
+{
+    for (unsigned g = 0; g < f->groups; g++) {
+        const fgroup_t *grp = &f->group[g];
+        const uint64_t v = (grp->source == SRC_ID ? (uint64_t)id : w[grp->source]) & grp->mask;
+
+        if (!fgroup_pass(grp, grp->source == SRC_ID ? (uint64_t)id : w[grp->source]))
+            continue;
+        for (unsigned m = grp->first; m < (unsigned)grp->first + grp->count; m++)
+            if (f->member[m] == target && f->member_value[m] == v)
+                return 1;
+    }
+    return 0;
+}
+
+#ifdef MTV_X86
+/* The vector filter against the scalar one on eight keys, some of them made to fit. */
+AVX2_FN static int t_filter8(const filter_t *f)
+{
+    uint64_t grp[2][4][4];
+    uint32_t id[8];
+    uint8_t coin[8];
+    unsigned want = 0;
+
+    os_random(coin, sizeof coin);
+    for (unsigned n = 0; n < 8; n++) {
+        uint64_t w[4];
+        uint8_t pk[32];
+
+        t_random_key(pk, &id[n]);
+        if (g_targets > 0 && (coin[n] & 1))
+            t_plant(&g_target[coin[n] % (unsigned)g_targets], pk, &id[n]);
+        t_words(w, pk);
+        for (int k = 0; k < 4; k++)
+            grp[n >> 2][k][n & 3] = w[k];
+        want |= (unsigned)filter_pass(f, w, id[n]) << n;
+    }
+    return filter8(f, (const uint64_t (*)[4][4])grp, id) != want;
+}
+#endif
+
+static void test_filter(int full)
+{
+    static const struct {
+        const char *spec;
+        unsigned groups;
+        int need_id;
+    } sets[] = {
+        {"dead", 1, 1},
+        {"dead,beef,cafe", 1, 1},                   /* one shape: one hashed group      */
+        {"dead,*beef,de*ef,c0de", 3, 1},
+        {"key:Me", 1, 0},                           /* no node ID: the CRC is skipped   */
+        {"key:Me,key:Yo,key:*w=", 2, 0},
+        {"keyhex:c0de,keyhex:*7f,key:*8", 3, 0},
+        {"id:dead+key:Mesh", 1, 0},                 /* filtered on the key alone        */
+        {"id:deadbeef+key:?l", 1, 1},               /* that key pattern fixes no bit    */
+        {"id:dead+key:Mesh,cafe", 2, 1},
+        {"id:?d?d,key:?l?l", 2, 1},                 /* nothing fixed: all keys pass     */
+        {"0,1,2,3,4,5,6,7,8,9,a,b,c,d,e,f", 1, 1},
+        {"key:A,key:B,key:C,id:d+key:D,id:e+key:E", 1, 0},
+        {"id:d+keyhex:a", 1, 0},                    /* a tie goes to the key: no CRC    */
+    };
+    const int rounds = full ? 400 : 16;
+    filter_t *f = (filter_t *)xalloc_aligned(sizeof *f);
+    int bad_shape = 0, missed = 0, kept = 0, bad_vector = 0;
+
+    for (size_t s = 0; s < ARRAY_LEN(sets); s++) {
+        if (!t_targets(sets[s].spec, 0)) {
+            bad_shape++;
+            continue;
+        }
+        targets_want(1);
+        filter_build(f);
+        bad_shape += f->groups != sets[s].groups || f->need_id != sets[s].need_id;
+
+        for (int i = 0; i < rounds; i++) {
+            const int k = i % g_targets;
+            uint64_t w[4];
+            uint8_t pk[32];
+            uint32_t id;
+
+            t_random_key(pk, &id);
+            t_plant(&g_target[k], pk, &id);
+            t_words(w, pk);
+            if (target_matches(&g_target[k], pk, id))
+                missed += !filter_pass(f, w, id) || !t_filter_claims(f, k, w, id);
+        }
+#ifdef MTV_X86
+        if (walk4_available())
+            for (int i = 0; i < rounds; i++)
+                bad_vector += t_filter8(f);
+#endif
+    }
+    t_check(bad_shape == 0, "filter: targets are grouped as intended, with and without node IDs");
+    t_check(missed == 0, "filter: no key that a target wants is filtered out");
+#ifdef MTV_X86
+    if (walk4_available())
+        t_check(bad_vector == 0, "filter: the vector form agrees with the scalar form");
+#else
+    (void)bad_vector;
+#endif
+
+    /* a target that has its key leaves the filter */
+    if (t_targets("dead,beef", 0)) {
+        targets_want(1);
+        g_target[0].found = 1;
+        filter_build(f);
+        for (int i = 0; i < rounds; i++) {
+            uint64_t w[4];
+            uint8_t pk[32];
+            uint32_t id;
+
+            t_random_key(pk, &id);
+            t_plant(&g_target[0], pk, &id);
+            t_words(w, pk);
+            kept += filter_pass(f, w, id);
+        }
+    } else {
+        kept = 1;
+    }
+    t_check(kept == 0 && f->groups == 1, "filter: a finished target is no longer looked for");
+
+    xfree_aligned(f);
+    targets_clear();
 }
 
 /*
@@ -2866,7 +4434,6 @@ static void test_walk(const backend_t *be, int full)
 {
     const unsigned lanes = be->lanes;
     const size_t slots = (size_t)lanes * WINDOW;
-    const pattern_t saved = g_pat;
     void *state = xalloc_aligned(be->state_size);
     walk_dump dump;
     lane_t before[MAX_LANES];
@@ -2877,7 +4444,8 @@ static void test_walk(const backend_t *be, int full)
     if (dump.words == NULL || dump.id == NULL)
         die("out of memory");
     memset(state, 0, be->state_size);
-    pattern_set_none();
+    targets_clear();
+    filter_reset();                     /* nothing matches; every node ID is computed */
     be->seed(state);
 
     for (int win = 0; win < 3; win++) {
@@ -2903,7 +4471,6 @@ static void test_walk(const backend_t *be, int full)
     }
     t_check(bad == 0, "backend %s: %u keys equal the reference ladder and CRC", be->name, checked);
 
-    g_pat = saved;
     secure_zero(state, be->state_size);
     xfree_aligned(state);
     free(dump.words);
@@ -2920,7 +4487,6 @@ static void test_exceptional_centre(const backend_t *be)
 {
     const unsigned lanes = be->lanes, victim = be->lanes - 1;
     const size_t slots = (size_t)lanes * WINDOW;
-    const pattern_t saved = g_pat;
     void *state = xalloc_aligned(be->state_size);
     walk_dump dump;
     lane_t before[MAX_LANES], after[MAX_LANES];
@@ -2931,7 +4497,8 @@ static void test_exceptional_centre(const backend_t *be)
     if (dump.words == NULL || dump.id == NULL)
         die("out of memory");
     memset(state, 0, be->state_size);
-    pattern_set_none();
+    targets_clear();
+    filter_reset();
     be->seed(state);
     be->set_centre(state, victim, &TAB[7]);
 
@@ -2959,52 +4526,100 @@ static void test_exceptional_centre(const backend_t *be)
     }
     t_check(bad == 0, "backend %s: a centre on a table point is abandoned cleanly", be->name);
 
-    g_pat = saved;
     secure_zero(state, be->state_size);
     xfree_aligned(state);
     free(dump.words);
     free(dump.id);
 }
 
-/* Search for real, capture the keys, and check each one from scratch. */
-static void test_search(const backend_t *be)
+/* A target for the end-to-end test and the tests' own reading of it, string by string. */
+typedef struct {
+    const char *spec;
+    int fold;
+    const char *id, *key, *hex;
+} t_wanted;
+
+/*
+ * Search for real, for several targets at once, capture the keys, and check
+ * each one from scratch: the key pair, the node ID, the pattern of the target
+ * it was found for, and that every target got exactly its share.
+ */
+static int t_search(const backend_t *be, const t_wanted *want, int count, int each)
 {
-    enum { WANT = 6 };
-    const pattern_t saved = g_pat;
+    const int total = count * each;
     const out_mode_t saved_mode = g_run.mode;
-    const uint64_t saved_wanted = g_run.hits_wanted;
-    hit_t hits[WANT];
+    hit_t *hits = (hit_t *)calloc((size_t)total, sizeof *hits);
     int bad = 0;
 
-    memset(hits, 0, sizeof hits);
-    bad += pattern_parse("a5,5a") != NULL;
+    if (hits == NULL)
+        die("out of memory");
+    targets_clear();
+    for (int k = 0; k < count; k++)
+        bad += targets_add(want[k].spec, want[k].fold) != NULL;
+    bad += g_targets != count;
     g_run.mode = OUT_CAPTURE;
     g_run.capture = hits;
-    g_run.hits_wanted = WANT;
-    (void)engine_run(be, 1, 0, 30.0, 0, 0);
-    bad += g_run.hits != WANT;
+    g_run.hits_wanted = targets_want((uint64_t)each);
+    (void)engine_run(be, 1, 0, 60.0, 0, 0);
+    bad += g_run.hits != (uint64_t)total;
+    for (int k = 0; k < g_targets; k++)
+        bad += g_target[k].found != (uint64_t)each;
 
-    for (int i = 0; i < WANT; i++) {
-        uint8_t pk[32];
+    for (int i = 0; i < total && bad == 0; i++) {
         const uint8_t *sk = hits[i].secret;
+        const int k = hits[i].target;
+        uint8_t pk[32];
         uint32_t id;
 
         x25519_ref(pk, sk, BASE_U);
         id = crc32_ref(pk, 32);
         bad += memcmp(pk, hits[i].public_key, 32) != 0 || id != hits[i].node_id;
-        bad += !((id >> 24) == 0xa5 || (id >> 24) == 0x5a);
+        bad += k < 0 || k >= count ||
+               !t_expect(pk, id, want[k].id, want[k].key, want[k].hex, want[k].fold);
         bad += (sk[0] & 7) != 0 || (sk[31] & 0xc0) != 0x40;         /* clamped */
-        for (int k = 0; k < i; k++)
-            bad += memcmp(sk, hits[k].secret, 32) == 0;
+        for (int e = 0; e < i; e++)
+            bad += memcmp(sk, hits[e].secret, 32) == 0;
     }
-    t_check(bad == 0 && atomic_load(&g_run.faults) == 0,
-            "backend %s: end-to-end search returns %d verified, distinct keys", be->name, WANT);
 
-    secure_zero(hits, sizeof hits);
-    g_pat = saved;
+    secure_zero(hits, (size_t)total * sizeof *hits);
+    free(hits);
     g_run.mode = saved_mode;
-    g_run.hits_wanted = saved_wanted;
+    g_run.hits_wanted = 0;
     g_run.capture = NULL;
+    targets_clear();
+    return bad;
+}
+
+static void test_search(const backend_t *be)
+{
+    static const t_wanted mixed[] = {
+        {"a5", 0, "a5*", NULL, NULL},
+        {"id:*5a", 0, "*5a", NULL, NULL},
+        {"id:?d?l?d", 0, "?d?l?d*", NULL, NULL},
+        {"key:Q", 0, NULL, "Q*", NULL},
+        {"key:*8=", 0, NULL, "*8=", NULL},
+        {"key:me", 1, NULL, "me*", NULL},
+        {"keyhex:c0", 0, NULL, NULL, "c0*"},
+        {"keyhex:*f", 0, NULL, NULL, "*f"},
+        {"id:7+key:z", 0, "7*", "z*", NULL},
+        {"a5", 0, "a5*", NULL, NULL},               /* the same target twice: two keys */
+    };
+    /* no target here reads every key's node ID, so the kernels skip the CRC */
+    static const t_wanted keys_only[] = {
+        {"key:Zz", 0, NULL, "Zz*", NULL},
+        {"id:5+key:Q", 0, "5*", "Q*", NULL},
+        {"keyhex:*3", 0, NULL, NULL, "*3"},
+        {"key:?d?d", 0, NULL, "?d?d*", NULL},
+    };
+    int bad;
+
+    bad = t_search(be, mixed, (int)ARRAY_LEN(mixed), 2);
+    t_check(bad == 0 && atomic_load(&g_run.faults) == 0,
+            "backend %s: %d targets at once, node IDs and public keys, 2 verified keys each",
+            be->name, (int)ARRAY_LEN(mixed));
+    bad = t_search(be, keys_only, (int)ARRAY_LEN(keys_only), 3);
+    t_check(bad == 0 && atomic_load(&g_run.faults) == 0,
+            "backend %s: public-key targets with the CRC left to the survivors", be->name);
 }
 
 #ifdef MTV_X86
@@ -3174,6 +4789,23 @@ AVX2_FN static void test_avx2(int full)
 }
 #endif
 
+/* The progress line is made of whole pieces, as many as there is room for. */
+static void test_status(void)
+{
+    status_t wide = {"", 40, 0}, tight = {"", 16, 0}, none = {"", -3, 0};
+    status_t *const all[] = {&wide, &tight, &none};
+
+    for (size_t i = 0; i < ARRAY_LEN(all); i++) {
+        status_add(all[i], "%d keys", 12345);
+        status_add(all[i], ", %.1f M/s", 67.89);
+        status_add(all[i], ", and a piece that is too long for a line of forty columns");
+        status_add(all[i], ", x");              /* would fit, but nothing follows a gap */
+    }
+    t_check(strcmp(wide.text, "12345 keys, 67.9 M/s") == 0 &&
+            strcmp(tight.text, "12345 keys") == 0 && none.text[0] == '\0',
+            "progress line: whole pieces, as many as the terminal has room for");
+}
+
 /* Returns the number of failed checks.  `only` restricts the backend tests. */
 static int self_test(int full, const backend_t *only)
 {
@@ -3184,7 +4816,9 @@ static int self_test(int full, const backend_t *only)
     test_field(full);
     test_curve(full);
     test_crc(full);
-    test_pattern();
+    test_targets(full);
+    test_filter(full);
+    test_status();
 #ifdef MTV_X86
     if (walk4_available())
         test_avx2(full);
@@ -3206,38 +4840,56 @@ static int self_test(int full, const backend_t *only)
 /* 13. Command line                                                          */
 /* ======================================================================== */
 
-static void usage(FILE *out)
+static void usage(int to)
 {
-    fprintf(out,
-        "mtvanity %s - vanity node IDs for Meshtastic firmware 2.8+\n"
+    char text[4096];
+    const int n = snprintf(text, sizeof text,
+        "mtvanity %s - vanity node IDs and public keys for Meshtastic firmware 2.8+\n"
         "%s\n"
         "\n"
-        "usage: mtvanity PATTERN [options]\n"
+        "usage: mtvanity TARGET [TARGET ...] [options]\n"
         "       mtvanity --benchmark [SECONDS]\n"
         "       mtvanity --self-test\n"
         "\n"
-        "PATTERN  1 to 8 hex digits, with an optional leading '!'.  Fewer than 8\n"
-        "         digits is a prefix: dead means !dead????.  The characters * ? . x\n"
-        "         stand for any digit: 'dc80*a'.  A comma-separated list matches any\n"
-        "         of its entries: 'dead,beef,cafe'.\n"
+        "A TARGET says what one key must look like.  Give several and they are\n"
+        "searched together; every target gets its own key.\n"
+        "  dead              node ID starts with dead         (same as id:dead)\n"
+        "  id:*beef          node ID ends with beef\n"
+        "  id:d..d.00d       a whole node ID with some digits left open\n"
+        "  key:Mesh          public key starts with Mesh      (base64, as apps show it)\n"
+        "  key:*Radio=       public key ends with Radio=\n"
+        "  keyhex:c0ffee     public key written in hex starts with c0ffee\n"
+        "  id:c0de+key:Me    one key that satisfies both\n"
+        "\n"
+        "Inside a pattern:\n"
+        "  .          any one character\n"
+        "  *          any run of characters, once: ab* starts, *ab ends, a*b both\n"
+        "  ?d ?l ?u   a digit, a lower-case letter, an upper-case letter\n"
+        "  ?h ?s ?a   one of 0-9a-f, + or /, any character   (as in hashcat masks)\n"
+        "Quote a pattern that contains * or ? so that the shell leaves it alone.\n"
         "\n"
         "options:\n"
-        "  --hits N          stop after N keys (default 1)\n"
-        "  --threads N       worker threads (default: every CPU)\n"
-        "  --max-keys N      give up after trying about N keys\n"
-        "  --backend NAME    auto (default: each thread times the kernels on its own\n"
-        "                    core and keeps the fastest), avx2 or scalar\n"
-        "  --no-pin          do not bind threads to CPUs\n"
-        "  --json            print each key as one JSON object per line\n"
-        "  --quiet           no progress or summary on stderr\n"
-        "  --benchmark [S]   measure every kernel for S seconds each (default 5)\n"
-        "  --self-test       run every known-answer and cross-check test\n"
+        "  --hits N           keys to find for each target (default 1)\n"
+        "  -i, --ignore-case  letters in key: patterns match in either case\n"
+        "  --threads N        worker threads (default: every CPU)\n"
+        "  --max-keys N       give up after trying about N keys\n"
+        "  --backend NAME     auto (default: each thread times the kernels on its own\n"
+        "                     core and keeps the fastest), avx2 or scalar\n"
+        "  --no-pin           do not bind threads to CPUs\n"
+        "  --json             print each key as one JSON object per line\n"
+        "  --quiet            no progress or summary on stderr\n"
+        "  --benchmark [S]    measure every kernel for S seconds each (default 5)\n"
+        "  --self-test        run every known-answer and cross-check test\n"
         "  --version, --help\n"
         "\n"
         "Keys go to stdout, everything else to stderr.  Install a key with\n"
         "  meshtastic --set security.private_key \"base64:...\"\n"
-        "after backing up the old one: a new key is a new node identity.\n",
+        "after backing up the old one: a new key is a new node identity.  Check\n"
+        "first that nobody on your mesh already uses the node ID.\n",
         MTV_VERSION, MTV_ATTRIBUTION);
+
+    if (n > 0)
+        (void)os_write(to, text, (size_t)n < sizeof text ? (size_t)n : sizeof text - 1);
 }
 
 /* Parse a non-negative integer argument strictly; returns -1 on any error. */
@@ -3257,40 +4909,112 @@ static long long parse_count(const char *s)
 
 static void run_benchmark(const backend_t *forced, int nthreads, int pin, double seconds)
 {
-    pattern_set_none();
+    targets_clear();
     g_run.mode = OUT_CAPTURE;
     g_run.hits_wanted = 0;
-    printf("benchmark: %d thread%s, %.0f s per line\n", nthreads, nthreads == 1 ? "" : "s", seconds);
+    out_printf("benchmark: %d thread%s, %.0f s per line\n", nthreads, nthreads == 1 ? "" : "s",
+               seconds);
 
     /* each kernel alone, then (i == count) every thread choosing for itself */
     for (size_t i = 0; i <= ARRAY_LEN(BACKENDS) && !g_interrupted; i++) {
         const backend_t *be = i < ARRAY_LEN(BACKENDS) ? BACKENDS[i] : NULL;
         const char *name = be ? be->name : "auto";
         run_result r;
-        char full_id[32];
+        char full_id[32], chosen[80] = "";
 
         if (forced != NULL && be != forced)
             continue;
         if (be != NULL && !be->available()) {
-            printf("  %-7s not supported by this CPU\n", name);
+            out_printf("  %-7s not supported by this CPU\n", name);
             continue;
         }
         r = engine_run(be, nthreads, pin, seconds, 0, 0);
+        if (r.keys == 0)
+            continue;                       /* interrupted before the first window */
         format_duration(full_id, sizeof full_id, 4294967296.0 * r.seconds / (double)r.keys);
-        printf("  %-7s %8.1f M keys/s   full 8-digit ID in about %s", name,
-               (double)r.keys / r.seconds / 1e6, full_id);
         if (be == NULL)
-            printf("   [%s]", r.kernels);
-        printf("\n");
-        fflush(stdout);
+            snprintf(chosen, sizeof chosen, "   [%s]", r.kernels);
+        out_printf("  %-7s %8.1f M keys/s   full 8-digit ID in about %s%s\n", name,
+                   (double)r.keys / r.seconds / 1e6, full_id, chosen);
     }
+}
+
+/* Say what is about to be searched for, and how much work that is. */
+static void print_plan(int nthreads, long long each)
+{
+    char count[40], extra[48] = "";
+    int width = 0;
+
+    /* first of all which build this is: a report of trouble is worth little without it */
+    err_printf("mtvanity %s (source revision %d)\n", MTV_VERSION, MTV_REVISION);
+    if (each > 1)
+        snprintf(extra, sizeof extra, ", %lld keys %s", each, g_targets == 1 ? "wanted" : "each");
+    if (g_targets == 1) {
+        format_count(count, sizeof count, 1.0 / g_target[0].chance);
+        err_printf("searching for %s: about %s keys per hit, %d thread%s%s\n\n",
+                   g_target[0].text, count, nthreads, nthreads == 1 ? "" : "s", extra);
+        return;
+    }
+    err_printf("searching for %d targets on %d thread%s%s\n", g_targets, nthreads,
+               nthreads == 1 ? "" : "s", extra);
+    for (int k = 0; k < g_targets; k++)
+        width = (int)strlen(g_target[k].text) > width ? (int)strlen(g_target[k].text) : width;
+    width = width > 44 ? 44 : width;
+    for (int k = 0; k < g_targets; k++) {
+        format_count(count, sizeof count, 1.0 / g_target[k].chance);
+        err_printf("  target %-3d %-*s  about %s keys per hit\n", k + 1, width,
+                   g_target[k].text, count);
+    }
+    err_printf("\n");
+}
+
+/* What came of it: one line in all, and one per target when there were several. */
+static void print_outcome(const run_result *res)
+{
+    char count[40], found[64];
+    int width = 0;
+
+    format_count(count, sizeof count, (double)res->keys);
+    if (g_run.hits_wanted == 1)
+        snprintf(found, sizeof found, "%" PRIu64 " key%s found", g_run.hits,
+                 g_run.hits == 1 ? "" : "s");
+    else
+        snprintf(found, sizeof found, "%" PRIu64 " of %" PRIu64 " keys found", g_run.hits,
+                 g_run.hits_wanted);
+    err_printf("%s; %s keys tried in %.2f s (%.1f M/s; kernels: %s)%s\n", found, count,
+               res->seconds, (double)res->keys / res->seconds / 1e6,
+               res->kernels[0] ? res->kernels : "none", g_interrupted ? "; interrupted" : "");
+
+    if (g_targets > 1) {
+        for (int k = 0; k < g_targets; k++)
+            width = (int)strlen(g_target[k].text) > width ? (int)strlen(g_target[k].text) : width;
+        width = width > 44 ? 44 : width;
+        for (int k = 0; k < g_targets; k++) {
+            const target_t *t = &g_target[k];
+            char got[40];
+
+            if (t->found == 0)
+                snprintf(got, sizeof got, "not found");
+            else if (t->wanted == 1)
+                snprintf(got, sizeof got, "!%08" PRIx32, t->first_id);
+            else
+                snprintf(got, sizeof got, "%" PRIu64 " of %" PRIu64 " keys", t->found, t->wanted);
+            err_printf("  target %-3d %-*s  %s\n", k + 1, width, t->text, got);
+        }
+    }
+    /* a terminal that is slow to take the status line is worth knowing about */
+    if (res->terminal_wait > SLOW_TERMINAL_SECONDS)
+        err_printf("note: the terminal took up to %.2f s to take one status line.  If its display\n"
+                   "      misbehaves, --threads N with N below the number of CPUs leaves it room.\n",
+                   res->terminal_wait);
 }
 
 int main(int argc, char **argv)
 {
-    const char *pattern = NULL, *backend_name = NULL, *err;
+    const char *spec[MAX_TARGETS], *backend_name = NULL, *err;
     const backend_t *be;
-    int nthreads = 0, quiet = 0, json = 0, bench = 0, selftest = 0, pin = 1;
+    int specs = 0, nthreads = 0, quiet = 0, json = 0, bench = 0, selftest = 0, pin = 1;
+    int ignore_case = 0;
     double bench_seconds = 5.0;
     unsigned long long key_limit = 0;
     long long hits_wanted = 1;
@@ -3301,10 +5025,11 @@ int main(int argc, char **argv)
         const char *next = i + 1 < argc ? argv[i + 1] : NULL;
 
         if (strcmp(a, "--help") == 0 || strcmp(a, "-h") == 0) {
-            usage(stdout);
+            usage(TO_STDOUT);
             return 0;
         } else if (strcmp(a, "--version") == 0) {
-            printf("mtvanity %s\n%s\nLicense: MIT\n", MTV_VERSION, MTV_ATTRIBUTION);
+            out_printf("mtvanity %s (source revision %d)\n%s\nLicense: MIT\n", MTV_VERSION,
+                       MTV_REVISION, MTV_ATTRIBUTION);
             return 0;
         } else if (strcmp(a, "--threads") == 0) {
             const long long v = parse_count(next);
@@ -3314,8 +5039,8 @@ int main(int argc, char **argv)
             i++;
         } else if (strcmp(a, "--hits") == 0) {
             hits_wanted = parse_count(next);
-            if (hits_wanted < 1)
-                die("--hits needs a positive number");
+            if (hits_wanted < 1 || hits_wanted > 1000000)
+                die("--hits needs a number between 1 and 1000000");
             i++;
         } else if (strcmp(a, "--max-keys") == 0) {
             const long long v = parse_count(next);
@@ -3334,33 +5059,41 @@ int main(int argc, char **argv)
             json = 1;
         } else if (strcmp(a, "--quiet") == 0) {
             quiet = 1;
+        } else if (strcmp(a, "--ignore-case") == 0 || strcmp(a, "-i") == 0) {
+            ignore_case = 1;
         } else if (strcmp(a, "--self-test") == 0) {
             selftest = 1;
         } else if (strcmp(a, "--benchmark") == 0) {
+            const long long v = parse_count(next);  /* optional: the seconds per line */
             bench = 1;
-            if (next != NULL && parse_count(next) > 0) {
-                bench_seconds = (double)parse_count(next);
+            if (v >= 0) {
+                if (v < 1 || v > 3600)
+                    die("--benchmark takes between 1 and 3600 seconds per line");
+                bench_seconds = (double)v;
                 i++;
             }
         } else if (a[0] == '-' && a[1] == '-') {
-            fprintf(stderr, "mtvanity: unknown option %s (try --help)\n", a);
+            err_printf("mtvanity: unknown option %s (try --help)\n", a);
             return 2;
-        } else if (pattern == NULL) {
-            pattern = a;
         } else {
-            die("only one pattern is allowed; join alternatives with commas");
+            if (specs == MAX_TARGETS)
+                die("too many targets (the limit is 64)");
+            spec[specs++] = a;
         }
     }
 
     if (!selftest && !bench) {
-        if (pattern == NULL) {
-            usage(stderr);
+        if (specs == 0) {
+            usage(TO_STDERR);
             return 2;
         }
-        err = pattern_parse(pattern);       /* report mistakes before doing any work */
-        if (err != NULL) {
-            fprintf(stderr, "mtvanity: bad pattern \"%s\": %s\n", pattern, err);
-            return 2;
+        targets_clear();                    /* report mistakes before doing any work */
+        for (int k = 0; k < specs; k++) {
+            err = targets_add(spec[k], ignore_case);
+            if (err != NULL) {
+                err_printf("mtvanity: bad target \"%s\": %s\n", spec[k], err);
+                return 2;
+            }
         }
     }
 
@@ -3375,16 +5108,15 @@ int main(int argc, char **argv)
 #ifdef MTV_X86
     walk4_init();
 #endif
-    pattern_set_none();
 
     if (selftest) {
         int failed;
-        printf("mtvanity %s self-test\n", MTV_VERSION);
+        out_printf("mtvanity %s (source revision %d) self-test\n", MTV_VERSION, MTV_REVISION);
         failed = self_test(1, NULL);
         if (failed)
-            printf("%d check(s) FAILED\n", failed);
+            out_printf("%d check(s) FAILED\n", failed);
         else
-            printf("all checks passed\n");
+            out_printf("all checks passed\n");
         return failed ? 1 : 0;
     }
 
@@ -3393,10 +5125,12 @@ int main(int argc, char **argv)
     if (backend_name != NULL && strcmp(backend_name, "auto") != 0) {
         be = backend_find(backend_name);
         if (be == NULL) {
-            fprintf(stderr, "mtvanity: unknown --backend; choose one of: auto");
-            for (size_t i = 0; i < ARRAY_LEN(BACKENDS); i++)
-                fprintf(stderr, " %s", BACKENDS[i]->name);
-            fprintf(stderr, "\n");
+            char names[64] = "auto";
+            for (size_t i = 0; i < ARRAY_LEN(BACKENDS); i++) {
+                const size_t used = strlen(names);
+                snprintf(names + used, sizeof names - used, " %s", BACKENDS[i]->name);
+            }
+            err_printf("mtvanity: unknown --backend; choose one of: %s\n", names);
             return 2;
         }
         if (!be->available())
@@ -3408,44 +5142,40 @@ int main(int argc, char **argv)
         nthreads = MAX_THREADS;
     /* binding only makes sense when there is one thread for every CPU */
     pin = pin && nthreads == os_cpu_count();
-    signal(SIGINT, on_interrupt);
 
     /* Never search with arithmetic that has not just been checked. */
     if (self_test(0, be) != 0)
         die("the start-up self-test failed; refusing to generate keys");
+
+    /* from here on Ctrl-C (or a polite kill) ends the search and still gets its summary */
+    signal(SIGINT, on_interrupt);
+    signal(SIGTERM, on_interrupt);
 
     if (bench) {
         run_benchmark(be, nthreads, pin, bench_seconds);
         return 0;
     }
 
-    err = pattern_parse(pattern);
-    if (err != NULL)
-        die("internal error: the pattern no longer parses");
+    targets_clear();                        /* the self-test used the target list */
+    for (int k = 0; k < specs; k++)
+        if (targets_add(spec[k], ignore_case) != NULL)
+            die("internal error: a target no longer parses");
     g_run.mode = json ? OUT_JSON : OUT_TEXT;
-    g_run.hits_wanted = (uint64_t)hits_wanted;
-    if (!quiet) {
-        char count[32];
-        format_count(count, sizeof count, pattern_expected_keys());
-        fprintf(stderr, "searching %d target%s with %d fixed digit%s: about %s keys per hit, "
-                        "%d thread%s\n",
-                g_pat.count, g_pat.count == 1 ? "" : "s",
-                g_pat.fixed_digits, g_pat.fixed_digits == 1 ? "" : "s",
-                count, nthreads, nthreads == 1 ? "" : "s");
-    }
+    g_run.hits_wanted = targets_want((uint64_t)hits_wanted);
+    if (!quiet)
+        print_plan(nthreads, hits_wanted);
 
     res = engine_run(be, nthreads, pin, 0.0, key_limit, !quiet);
 
-    if (!quiet) {
-        char count[32];
-        format_count(count, sizeof count, (double)res.keys);
-        fprintf(stderr, "%" PRIu64 " key%s found; %s keys tried in %.2f s (%.1f M/s; kernels: %s)%s\n",
-                g_run.hits, g_run.hits == 1 ? "" : "s", count, res.seconds,
-                (double)res.keys / res.seconds / 1e6, res.kernels[0] ? res.kernels : "none",
-                g_interrupted ? "; interrupted" : "");
-    }
+    if (!quiet)
+        print_outcome(&res);
     if (atomic_load(&g_run.faults) != 0)
-        fprintf(stderr, "mtvanity: warning: %llu candidate(s) failed verification and were "
-                        "discarded; please report this\n", atomic_load(&g_run.faults));
+        err_printf("mtvanity: warning: %llu candidate(s) failed verification and were "
+                   "discarded; please report this\n", atomic_load(&g_run.faults));
+    if (g_run.output_failed) {
+        err_printf("mtvanity: a key could not be written to stdout (disk full? pipe closed?); "
+                   "that key is lost and the search was stopped\n");
+        return 1;
+    }
     return g_run.hits >= g_run.hits_wanted ? 0 : 3;
 }

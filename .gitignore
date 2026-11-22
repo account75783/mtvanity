@@ -7,3 +7,7 @@ $RECYCLE.BIN/
 System Volume Information/
 *.tmp
 ~$*
+builds/
+builds-*/
+*.exe
+SHA256SUMS*

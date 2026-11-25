@@ -6,10 +6,10 @@ Vanity node ID and public key generator for Meshtastic 2.8+ radios (Heltec V4 an
 
 **Do not use another person's node ID.** Two nodes with the same ID disrupt traffic on the mesh: messages, routing and other people's node lists can all get confused, for them and for you.
 
-Before you write a key to your radio, check that nobody on your mesh already has that ID:
+Before you write a key to your radio, check that nobody on your mesh already has that ID (replace `c0ffee42` with yours):
 
 ```
-meshtastic --nodes | grep -i NODEHASHHERE || echo "not seen by this radio"
+meshtastic --nodes | grep -i c0ffee42 || echo "not seen by this radio"
 ```
 
 Your radio only knows the nodes it has heard, so also check your local mesh map or ask in your mesh's group chat.
@@ -18,11 +18,11 @@ Take someone else's ID on purpose and expect to get T-hunted: the people whose m
 
 ## Status
 
-**Release:** V1.1 (2026-11-21)
+**Release:** V1.1 (2026-11-21). Prebuilt binaries for Linux and Windows are on the [Releases page](https://github.com/account75783/mtvanity/releases); see [Verifying a release](#verifying-a-release) before running one.
 
 **New in V1.1: vanity public keys.** You can now choose how the public key starts or ends as well as the node ID, ask for both in one key, and search for several keys in one run.
 
-**Tested and working on Meshtastic firmware 2.8, the latest release, on 2026-11-17.** A generated key was written to a real radio and the node ID changed to the chosen value. (2.8.1 alpha was the current firmware release on that date. The test was done with V1; V1.1 makes the same kind of key.)
+**Tested on a real radio on 2026-11-17, with firmware 2.8** (the latest stable release that day; 2.8.1 was in alpha). A generated key was written to the radio and the node ID changed to the chosen value. The test was done with V1; V1.1 makes the same kind of key.
 
 ## Authorship
 
@@ -60,7 +60,7 @@ Measured:
 |---|---|---|
 | Intel Core i9-14900HX (laptop, 32 threads), Linux build under WSL | 516 M | about 8 s |
 | Same laptop, native Windows build | 496 M | about 9 s |
-| 2 cloud Xeon cores (Sapphire Rapids) | 62 M | about 70 s |
+| 2 cloud Xeon cores (Sapphire Rapids) | 60 M | about 71 s |
 
 Predicted from core counts and multiply speeds, **not measured**; treat each as good to within a factor of two:
 
@@ -82,7 +82,7 @@ No 64-bit CPU is hopeless, but these are predicted to be slow enough to notice (
 | Core 2 Duo (2006 to 2009) | about 14 M | about 5 min |
 | Celeron N2840 and other 2-core Bay Trail Atoms | about 7 M | about 10 min |
 | Raspberry Pi 3 or Zero 2 W (64-bit OS) | about 5 M | about 15 min |
-| Single-core Athlon 64 or 64-bit Pentium 4 | 3 to 5 M | 15 to 20 min |
+| Single-core Athlon 64 or 64-bit Pentium 4 | 3 to 5 M | 15 to 25 min |
 | First-generation Atom netbook or nettop (D510, N450) | about 2 M | about 35 min |
 
 - **Averages hide bad luck.** One search in twenty takes more than three times the average, so the last row can run for two hours.
@@ -132,7 +132,7 @@ Already have the source? Skip the clone and run only the `gcc` or `clang` part. 
 
 ### Release binaries
 
-Release builds add `-s -static`, so the program needs no shared libraries.
+The binaries on the [Releases page](https://github.com/account75783/mtvanity/releases) are built with the lines below. Release builds add `-s -static`, so the program needs no shared libraries.
 
 Linux x86_64:
 
@@ -207,7 +207,7 @@ What you can write:
 | `id:c0de+key:Me` | one key that fits both patterns |
 | `*` | any run of characters: `'id:*beef'` ends with `beef`, `'key:Me*Q='` starts with `Me` and ends with `Q=` |
 | `.` | any one character: `id:d..d.00d` |
-| `?d` `?l` `?u` `?h` `?H` `?s` `?a` | hashcat mask placeholders: a digit, a lower-case letter, an upper-case letter, a hex digit (lower case, upper case), `+` or `/`, any character |
+| `?d` `?l` `?u` `?h` `?H` `?s` `?a` | hashcat-style mask placeholders: a digit, a lower-case letter, an upper-case letter, a hex digit (lower case, upper case), `+` or `/`, any character |
 
 - **Public key patterns are case-sensitive.** Add `-i` to accept either case, which also makes the search faster.
 - **Quote patterns that contain `*` or `?`** so the shell leaves them alone. The Windows command prompt needs no quotes.
@@ -254,7 +254,7 @@ New:
 - **Vanity public keys.** `key:` chooses how the base64 public key starts or ends, and `keyhex:` does the same for its hex form.
 - **A node ID and a public key in one key**, such as `id:c0de+key:Me`.
 - **Several keys in one run.** Up to 64 targets are searched together, each gets its own key, and the run ends with a summary.
-- **Mask patterns.** `*` for any run of characters, `.` for any one, and the hashcat placeholders `?d ?l ?u ?h ?H ?s ?a`.
+- **Mask patterns.** `*` for any run of characters, `.` for any one, and the hashcat-style placeholders `?d ?l ?u ?h ?H ?s ?a`.
 - **`-i`** accepts either case in a public key pattern.
 
 Changed:
@@ -285,11 +285,15 @@ The search kernels are the ones from V1, and the speed is the same.
 | 2 shared cloud cores (Xeon Sapphire Rapids, about 3 GHz, gcc 13.3) | AVX2 | 60.2 M | about 71 s |
 | Same 2 cloud cores | Scalar | 33.2 M | about 2.2 min |
 
-Details of the laptop run are in `BENCHMARK-i9-14900HX.md`.
+Details of the laptop run are in [BENCHMARK-i9-14900HX.md](BENCHMARK-i9-14900HX.md).
 
-These figures were measured with V1. V1.1 uses the same search code and is as fast: on the two cloud cores, run back to back (the machine was a little faster that day than when the table was made), V1 and V1.1 both did 67 to 70 M keys per second for one node ID, and V1.1 did 72 M for a public key alone and 63 M with 64 node IDs at once. The slow case is a pattern with no fixed character at all, such as one made only of `?l`: about 42 M, because every key has to be looked at in full.
+These figures were measured with V1. V1.1 uses the same search code and runs at the same speed. Run back to back on the two cloud cores (on a day the machine was a little faster than when the table was made):
 
-On the laptop under Windows, V1.1 ran at 515.6 M keys per second with `--threads 24`, as many threads as it has cores: as fast as the best figure in the table for all 32.
+- V1 and V1.1 both did 67 to 70 M keys per second for one node ID.
+- V1.1 did 72 M for a public key alone, and 63 M with 64 node IDs at once.
+- The slow case is a pattern with no fixed character at all, such as one made only of `?l`: about 42 M, because every key has to be looked at in full.
+
+On the laptop under Windows, V1.1 ran at 515.6 M keys per second with `--threads 24`, one thread per core. That matches the best figure in the table, which used all 32 threads.
 
 How it gets there:
 
@@ -308,7 +312,7 @@ Checked:
 - 1,800 keys for node ID, public key and combined targets were re-derived outside the program by separate Python code (its own X25519, zlib's CRC-32, Python's base64 and a regex reading of each pattern). All matched.
 - Clean under ASan, UBSan and TSan (gcc), and under strict warnings with gcc and clang.
 - An exact 8-digit ID was found end to end, in the same run as a vanity public key.
-- Confirmed by the human on a real radio running the latest 2.8 firmware (2026-11-17), with a V1 key: after a generated key is written, the node ID re-derives to the chosen value.
+- Confirmed by the human on a real radio running firmware 2.8 (2026-11-17), with a V1 key: after a generated key is written, the node ID re-derives to the chosen value.
 - The static Linux x86_64 release build passes the self-test and runs at the same speed as the normal build.
 - The native Windows x86_64 build (static, MinGW-w64 gcc) passes the full self-test on Windows 11 on the i9-14900HX (V1.1 on 2026-11-21; V1 also ran the benchmark there on 2026-11-18).
 - On that laptop under Windows, with a search thread on each of its 32 CPUs, the status line stays in place. Before the search threads gave way to other programs it did not: it landed on a new row at each update unless `--threads` was set below the number of CPUs.
@@ -324,7 +328,7 @@ Not yet checked:
 
 - Keys come from the OS random generator only (`getrandom`, `arc4random_buf`, `BCryptGenRandom`).
 - Private keys are written to stdout only, secrets are wiped after use, and core dumps (Linux) and crash dumps (Windows, best effort) are disabled.
-- The search is not constant-time. Run it on a machine you trust.
+- The search is not constant-time. Run it on a machine you trust. On a rented cloud machine, copy the key off and terminate the instance when you are done, so its disk goes with it.
 - A node ID is a 32-bit label, not proof of identity: anyone can generate a key with the same ID. The public key is what identifies a node, and only the whole of it: anyone can also generate a key that starts or ends like yours.
 - A vanity key is as strong as any other. The search fixes a few public characters and leaves the private key random.
 - IDs `!00000000` to `!00000003` and `!ffffffff` are reserved and refused.
@@ -340,7 +344,7 @@ Both are meant to come as optional `.h` header libraries next to `mtvanity.c`, s
 
 ## License
 
-MIT. See `LICENSE`.
+MIT. See [LICENSE](LICENSE).
 
 ## Support
 

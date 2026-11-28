@@ -14,12 +14,14 @@
  *   Windows:  gcc -O3 -Wa,-muse-unaligned-vector-move mtvanity.c -o mtvanity.exe -lbcrypt
  *             (MSYS2 UCRT64.  The -Wa option works around GCC bug 54412:
  *             on 64-bit Windows gcc aligns the stack to 16 bytes yet moves
- *             32-byte vectors as if they were aligned.  clang needs no
- *             such option.)
+ *             32- and 64-byte vectors as if they were aligned.  clang needs
+ *             no such option.)
  *   Android:  clang -O3 -march=armv8-a+crc -pthread mtvanity.c -o mtvanity -lm
  *   The x86 kernels are selected at run time, so one binary serves every
  *   x86-64 CPU and -march=native is not needed.
  *   Add -s -static for a release binary that needs no shared libraries.
+ *   NVIDIA GPU (optional): add -DMTV_CUDA, and -ldl on Linux, with
+ *   mtvanity_cuda.h next to this file.  Not together with -static on Linux.
  *   A 64-bit target is required (the field arithmetic uses 128-bit
  *   integers).  On Windows at most 64 logical CPUs are used.
  *
@@ -50,14 +52,17 @@
  *      encoding ride on the last squaring's carry chain; the rare value
  *      that needs more is detected and finished exactly.
  *   5. CRC-32 without tables.  Five carry-less multiplications reduce a
- *      32-byte message directly (PCLMULQDQ, two messages at a time with
- *      VPCLMULQDQ); ARMv8 uses its CRC32 instructions.
+ *      32-byte message directly (PCLMULQDQ; two or four messages at a time
+ *      with VPCLMULQDQ); ARMv8 uses its CRC32 instructions.
  *   6. AVX2.  Four independent walks run in lockstep, one per 64-bit lane,
  *      on radix-2^25.5 field elements.
- *   7. Per-core choice.  Each thread times the kernels on the core it is
- *      bound to and keeps the faster one, which matters on CPUs that mix
+ *   7. AVX-512.  Eight walks in lockstep.  The IFMA instructions multiply
+ *      52-bit numbers, so a field element needs five limbs where AVX2 needs
+ *      ten, and a product a quarter of the limb multiplications.
+ *   8. Per-core choice.  Each thread times the kernels on the core it is
+ *      bound to and keeps the fastest, which matters on CPUs that mix
  *      performance and efficiency cores.
- *   8. One comparison per key.  Whatever is asked for is boiled down to
+ *   9. One comparison per key.  Whatever is asked for is boiled down to
  *      the bits every match must share; a key is examined closely only if
  *      those bits fit.  Any number of targets of the same shape cost one
  *      hashed look-up, and when only public keys are constrained the
@@ -112,6 +117,7 @@
 
 #include <errno.h>
 #include <inttypes.h>
+#include <limits.h>
 #include <math.h>
 #include <signal.h>
 #include <stdarg.h>
@@ -145,7 +151,7 @@
 #endif
 
 #if defined(_WIN32) && defined(__GNUC__) && !defined(__clang__)
-#  pragma message("mtvanity: gcc on Windows needs -Wa,-muse-unaligned-vector-move (see BUILD)")
+#  pragma message("mtvanity: reminder: gcc on Windows must be run with -Wa,-muse-unaligned-vector-move (see BUILD); this note is shown either way")
 #endif
 
 /* -DMTV_PORTABLE_ONLY builds without any x86-specific code, for comparison. */
@@ -159,8 +165,8 @@
 #  define MTV_ARM_CRC 1
 #endif
 
-#define MTV_VERSION     "V1.1"
-#define MTV_REVISION    4           /* of the source, so that a stale build can be told apart */
+#define MTV_VERSION     "V1.2"
+#define MTV_REVISION    6           /* of the source, so that a stale build can be told apart */
 #define MTV_ATTRIBUTION "Authored by Claude, assisted by a human."
 
 /* A window is the 2W+1 keys centred on one point; W is also the table size. */
@@ -169,7 +175,7 @@
 
 #define MAX_THREADS 1024
 #define MAX_TARGETS 64
-#define MAX_LANES   4
+#define MAX_LANES   8
 
 #define LIKELY(x)     __builtin_expect(!!(x), 1)
 #define UNLIKELY(x)   __builtin_expect(!!(x), 0)
@@ -645,15 +651,16 @@ static void output_unlock(void) { pthread_mutex_unlock(&g_output_lock); }
 
 #ifdef MTV_X86
 static struct {
-    int pclmul;     /* PCLMULQDQ (and SSE4.1)          */
-    int avx2;       /* AVX2, with OS support for YMM   */
-    int vpclmul;    /* VPCLMULQDQ on YMM               */
+    int pclmul;     /* PCLMULQDQ (and SSE4.1)                                  */
+    int avx2;       /* AVX2, with OS support for YMM                           */
+    int vpclmul;    /* VPCLMULQDQ on YMM                                       */
+    int avx512;     /* AVX-512 F and IFMA, VPCLMULQDQ on ZMM, OS support for ZMM */
 } g_cpu;
 
 static void cpu_detect(void)
 {
     unsigned a, b, c, d;
-    int os_ymm = 0, avx = 0;
+    int os_ymm = 0, os_zmm = 0, avx = 0;
 
     if (__get_cpuid(1, &a, &b, &c, &d)) {
         g_cpu.pclmul = ((c >> 1) & 1) && ((c >> 19) & 1);     /* the code also uses SSE4.1 */
@@ -663,11 +670,14 @@ static void cpu_detect(void)
             __asm__ __volatile__("xgetbv" : "=a"(lo), "=d"(hi) : "c"(0));
             (void)hi;
             os_ymm = (lo & 6) == 6;                 /* XMM and YMM state enabled */
+            os_zmm = (lo & 0xe6) == 0xe6;           /* and the mask registers and ZMM */
         }
     }
     if (__get_cpuid_count(7, 0, &a, &b, &c, &d)) {
         g_cpu.avx2 = os_ymm && avx && ((b >> 5) & 1);
         g_cpu.vpclmul = g_cpu.avx2 && g_cpu.pclmul && ((c >> 10) & 1);
+        /* EBX bit 16: AVX512F, bit 21: AVX512IFMA */
+        g_cpu.avx512 = g_cpu.vpclmul && os_zmm && ((b >> 16) & 1) && ((b >> 21) & 1);
     }
 }
 #endif /* MTV_X86 */
@@ -2558,6 +2568,7 @@ typedef struct {
     void      (*window)(void *state, const walk_dump *d);   /* one window on every lane    */
     /* place a lane's next window at centre c (canonical); seeding and tests use it */
     void      (*set_centre)(void *state, unsigned lane, const mpoint *c);
+    unsigned    runs;                                       /* separate runs through the table */
 } backend_t;
 
 /* ======================================================================== */
@@ -2689,7 +2700,7 @@ static void walk1_window(void *state, const walk_dump *dump)
 }
 
 static const backend_t BACKEND_SCALAR = {
-    "scalar", 1, sizeof(walk1_t), walk1_available, walk1_seed, walk1_window, walk1_set_centre,
+    "scalar", 1, sizeof(walk1_t), walk1_available, walk1_seed, walk1_window, walk1_set_centre, 1,
 };
 
 /* ======================================================================== */
@@ -3404,14 +3415,700 @@ AVX2_FN static void walk4_window(void *state, const walk_dump *dump)
 }
 
 static const backend_t BACKEND_AVX2 = {
-    "avx2", 4, sizeof(walk4_t), walk4_available, walk4_seed, walk4_window, walk4_set_centre,
+    "avx2", 4, sizeof(walk4_t), walk4_available, walk4_seed, walk4_window, walk4_set_centre, 1,
 };
 
 #endif /* MTV_X86 */
 
+/* ======================================================================== */
+/* 11. AVX-512 kernel (eight lanes, five 51-bit limbs)                       */
+/*                                                                           */
+/* The IFMA instructions multiply the low 52 bits of two 64-bit elements     */
+/* and add the low or the high 52 bits of the 104-bit product to a third.    */
+/* That suits the five limbs of section 5, where AVX2 needs ten.  An fe8     */
+/* holds eight field elements, limb k of lane l in 64-bit element l of       */
+/* vector k.  The kernel needs AVX-512 F and IFMA, and VPCLMULQDQ on 512-bit */
+/* registers: Intel since Ice Lake, AMD since Zen 4.                         */
+/*                                                                           */
+/* Bounds:                                                                   */
+/*   weak   limb 0 < 2^51 + 2^17, limbs 1..4 < 2^51: what a product, a       */
+/*          square or FE8_CARRY leaves behind                                */
+/*   tight  no limb above 2^51: what FE8_CARRY_TIGHT leaves behind.  A tight */
+/*          element plus a canonical one has limbs below 2^52.               */
+/* The instructions ignore everything above bit 51 of a factor, so every     */
+/* operand of a multiplication must have limbs below 2^52.  fe8_sq needs a   */
+/* weak operand.                                                             */
+/* ======================================================================== */
+
+#ifdef MTV_X86
+
+#define AVX512_ISA    "avx512f,avx512ifma,vpclmulqdq"
+#define AVX512_FN     __attribute__((target(AVX512_ISA)))
+#define AVX512_INLINE static inline __attribute__((always_inline, target(AVX512_ISA)))
+
+#define V8_ADD(a, b)  _mm512_add_epi64((a), (b))
+#define V8_SUB(a, b)  _mm512_sub_epi64((a), (b))
+#define V8_AND(a, b)  _mm512_and_si512((a), (b))
+#define V8_OR(a, b)   _mm512_or_si512((a), (b))
+#define V8_SHR(a, n)  _mm512_srli_epi64((a), (n))
+#define V8_SHL(a, n)  _mm512_slli_epi64((a), (n))
+#define V8_SET1(x)    _mm512_set1_epi64((long long)(x))
+#define V8_ZERO()     _mm512_setzero_si512()
+#define V8_LOAD(p)    _mm512_loadu_si512((const void *)(p))
+#define V8_STORE(p, a) _mm512_storeu_si512((void *)(p), (a))
+
+typedef struct {
+    __m512i l[5];
+} fe8;
+
+/* limb-wise 2p and 4p: adding one keeps a subtraction's limbs non-negative */
+static const uint64_t TWO_P_51[5] = {
+    0xfffffffffffdaULL, 0xffffffffffffeULL, 0xffffffffffffeULL, 0xffffffffffffeULL,
+    0xffffffffffffeULL,
+};
+static const uint64_t FOUR_P_51[5] = {
+    0x1fffffffffffb4ULL, 0x1ffffffffffffcULL, 0x1ffffffffffffcULL, 0x1ffffffffffffcULL,
+    0x1ffffffffffffcULL,
+};
+
+/* src and dst are uint64_t[5][8] arrays: [limb][lane] */
+AVX512_INLINE void fe8_load(fe8 *r, const uint64_t *src)
+{
+    for (int k = 0; k < 5; k++)
+        r->l[k] = V8_LOAD(src + 8 * k);
+}
+
+AVX512_INLINE void fe8_store(uint64_t *dst, const fe8 *a)
+{
+    for (int k = 0; k < 5; k++)
+        V8_STORE(dst + 8 * k, a->l[k]);
+}
+
+/*
+ * Carry five 64-bit columns (each < 2^63) down to a weak element, or with
+ * one more step to a tight one.  The carry out of the top limb is below
+ * 2^12, so IFMA can fold it back in (2^255 = 19) with a single instruction.
+ */
+#define FE8_STEP(lo, hi)                                                    \
+    do {                                                                    \
+        hi = V8_ADD(hi, V8_SHR(lo, 51));                                    \
+        lo = V8_AND(lo, mask51_);                                           \
+    } while (0)
+
+#define FE8_CHAIN(c0, c1, c2, c3, c4)                                       \
+    do {                                                                    \
+        FE8_STEP(c0, c1); FE8_STEP(c1, c2); FE8_STEP(c2, c3); FE8_STEP(c3, c4); \
+        c0 = _mm512_madd52lo_epu64(c0, V8_SHR(c4, 51), V8_SET1(19));        \
+        c4 = V8_AND(c4, mask51_);                                           \
+    } while (0)
+
+#define FE8_CARRY(out, c0, c1, c2, c3, c4)                                  \
+    do {                                                                    \
+        const __m512i mask51_ = V8_SET1(MASK51);                            \
+        FE8_CHAIN(c0, c1, c2, c3, c4);                                      \
+        (out)->l[0] = c0; (out)->l[1] = c1; (out)->l[2] = c2; (out)->l[3] = c3; (out)->l[4] = c4; \
+    } while (0)
+
+#define FE8_CARRY_TIGHT(out, c0, c1, c2, c3, c4)                            \
+    do {                                                                    \
+        const __m512i mask51_ = V8_SET1(MASK51);                            \
+        FE8_CHAIN(c0, c1, c2, c3, c4);                                      \
+        FE8_STEP(c0, c1);                                                   \
+        (out)->l[0] = c0; (out)->l[1] = c1; (out)->l[2] = c2; (out)->l[3] = c3; (out)->l[4] = c4; \
+    } while (0)
+
+/*
+ * A schoolbook product.  The limb product x * y of column k (the sum of the
+ * two limb numbers) arrives in two halves: its low 52 bits belong to column
+ * k; the rest is worth 2^52 there, which is twice column k + 1.  Columns
+ * 5..9 wrap around (2^255 = 19), so with lo_k and hi_k the sums of the low
+ * and of the high halves of column k, column k of the result is
+ *
+ *     lo_k + 2 hi_(k-1) + 19 z_(k+5),      z_m = lo_m + 2 hi_(m-1),
+ *
+ * which stays below 2^61 whatever 52-bit limbs went in.
+ */
+#define FE8_HI(k, x, y) hi##k = _mm512_madd52hi_epu64(hi##k, (x), (y))
+#define FE8_LO(k, x, y) lo##k = _mm512_madd52lo_epu64(lo##k, (x), (y))
+
+/* 19 z = z + 2 z + 16 z, and 19 z + 2 h = z + 2 (z + h) + 16 z */
+#define FE8_WRAP(z)       V8_ADD(V8_ADD((z), V8_SHL((z), 1)), V8_SHL((z), 4))
+#define FE8_WRAP_ADD(z, h) V8_ADD(V8_ADD((z), V8_SHL(V8_ADD((z), (h)), 1)), V8_SHL((z), 4))
+
+/*
+ * The limb products of f * g, column by column.  Limb 0 is the last a carry
+ * chain delivers, so its products come last in every column.
+ */
+#define FE8_MUL_HIGH_HALVES(H)                                              \
+    H(1, f1, g0); H(2, f1, g1); H(3, f1, g2); H(4, f1, g3); H(5, f1, g4);   \
+    H(2, f2, g0); H(3, f2, g1); H(4, f2, g2); H(5, f2, g3); H(6, f2, g4);   \
+    H(3, f3, g0); H(4, f3, g1); H(5, f3, g2); H(6, f3, g3); H(7, f3, g4);   \
+    H(4, f4, g0); H(5, f4, g1); H(6, f4, g2); H(7, f4, g3); H(8, f4, g4);   \
+    H(0, f0, g0); H(1, f0, g1); H(2, f0, g2); H(3, f0, g3); H(4, f0, g4)
+#define FE8_MUL_LOW_HALVES_5_TO_8(L)                                        \
+    L(5, f1, g4); L(5, f2, g3); L(6, f2, g4); L(5, f3, g2); L(6, f3, g3);   \
+    L(7, f3, g4); L(5, f4, g1); L(6, f4, g2); L(7, f4, g3); L(8, f4, g4)
+#define FE8_MUL_LOW_HALVES_0_TO_4(L)                                        \
+    L(1, f1, g0); L(2, f1, g1); L(3, f1, g2); L(4, f1, g3);                 \
+    L(2, f2, g0); L(3, f2, g1); L(4, f2, g2);                               \
+    L(3, f3, g0); L(4, f3, g1);                                             \
+    L(4, f4, g0);                                                           \
+    L(0, f0, g0); L(1, f0, g1); L(2, f0, g2); L(3, f0, g3); L(4, f0, g4)
+
+/*
+ * The same for f^2.  A product of two different limbs counts twice, so one
+ * of its factors is doubled (d_j = 2 f_j): never limb 0, the only one of a
+ * weak element that may exceed 2^51.
+ */
+#define FE8_SQ_HIGH_HALVES(H)                                               \
+    H(2, f1, f1); H(3, f1, d2); H(4, f1, d3); H(5, f1, d4);                 \
+    H(4, f2, f2); H(5, f2, d3); H(6, f2, d4);                               \
+    H(6, f3, f3); H(7, f3, d4);                                             \
+    H(8, f4, f4);                                                           \
+    H(0, f0, f0); H(1, f0, d1); H(2, f0, d2); H(3, f0, d3); H(4, f0, d4)
+#define FE8_SQ_LOW_HALVES_5_TO_8(L)                                         \
+    L(5, f1, d4); L(5, f2, d3); L(6, f2, d4); L(6, f3, f3); L(7, f3, d4); L(8, f4, f4)
+#define FE8_SQ_LOW_HALVES_0_TO_4(L)                                         \
+    L(2, f1, f1); L(3, f1, d2); L(4, f1, d3);                               \
+    L(4, f2, f2);                                                           \
+    L(0, f0, f0); L(1, f0, d1); L(2, f0, d2); L(3, f0, d3); L(4, f0, d4)
+
+/*
+ * Collect the products named by the three lists into the columns c0..c4,
+ * declared here, on top of the addends e0..e4.  Every sum has an accumulator
+ * of its own, so that no chain of dependent instructions is longer than the
+ * five products of the middle column.
+ */
+#define FE8_COLUMNS(HIGH, LOW58, LOW04, e0, e1, e2, e3, e4)                 \
+    __m512i hi0 = V8_ZERO(), hi1 = V8_ZERO(), hi2 = V8_ZERO(), hi3 = V8_ZERO(), hi4 = V8_ZERO(), \
+            hi5 = V8_ZERO(), hi6 = V8_ZERO(), hi7 = V8_ZERO(), hi8 = V8_ZERO(), \
+            lo0 = (e0), lo1 = (e1), lo2 = (e2), lo3 = (e3), lo4 = (e4),     \
+            lo5 = V8_ZERO(), lo6 = V8_ZERO(), lo7 = V8_ZERO(), lo8 = V8_ZERO(), \
+            c0, c1, c2, c3, c4, z5, z6, z7, z8, z9;                         \
+    HIGH(FE8_HI); LOW58(FE8_LO); LOW04(FE8_LO);                             \
+    z5 = V8_ADD(lo5, V8_ADD(hi4, hi4)); z6 = V8_ADD(lo6, V8_ADD(hi5, hi5)); \
+    z7 = V8_ADD(lo7, V8_ADD(hi6, hi6)); z8 = V8_ADD(lo8, V8_ADD(hi7, hi7)); \
+    z9 = V8_ADD(hi8, hi8);                                                  \
+    c0 = V8_ADD(lo0, FE8_WRAP(z5));                                         \
+    c1 = V8_ADD(lo1, FE8_WRAP_ADD(z6, hi0)); c2 = V8_ADD(lo2, FE8_WRAP_ADD(z7, hi1)); \
+    c3 = V8_ADD(lo3, FE8_WRAP_ADD(z8, hi2)); c4 = V8_ADD(lo4, FE8_WRAP_ADD(z9, hi3))
+
+#define FE8_MUL_COLUMNS(f, g)                                               \
+    const __m512i f0 = (f)->l[0], f1 = (f)->l[1], f2 = (f)->l[2], f3 = (f)->l[3], f4 = (f)->l[4]; \
+    const __m512i g0 = (g)->l[0], g1 = (g)->l[1], g2 = (g)->l[2], g3 = (g)->l[3], g4 = (g)->l[4]; \
+    FE8_COLUMNS(FE8_MUL_HIGH_HALVES, FE8_MUL_LOW_HALVES_5_TO_8, FE8_MUL_LOW_HALVES_0_TO_4, \
+                V8_ZERO(), V8_ZERO(), V8_ZERO(), V8_ZERO(), V8_ZERO())
+
+#define FE8_SQ_COLUMNS(f, e0, e1, e2, e3, e4)                               \
+    const __m512i f0 = (f)->l[0], f1 = (f)->l[1], f2 = (f)->l[2], f3 = (f)->l[3], f4 = (f)->l[4]; \
+    const __m512i d1 = V8_ADD(f1, f1), d2 = V8_ADD(f2, f2), d3 = V8_ADD(f3, f3), d4 = V8_ADD(f4, f4); \
+    FE8_COLUMNS(FE8_SQ_HIGH_HALVES, FE8_SQ_LOW_HALVES_5_TO_8, FE8_SQ_LOW_HALVES_0_TO_4, \
+                e0, e1, e2, e3, e4)
+
+/*
+ * out = f * g; limbs of f and g below 2^52, out weak.  out may alias f or g.
+ * If one factor has only just been computed, pass it as f.
+ */
+AVX512_INLINE void fe8_mul(fe8 *out, const fe8 *f, const fe8 *g)
+{
+    FE8_MUL_COLUMNS(f, g);
+    FE8_CARRY(out, c0, c1, c2, c3, c4);
+}
+
+/* out = f^2; f weak, out weak */
+AVX512_INLINE void fe8_sq(fe8 *out, const fe8 *f)
+{
+    FE8_SQ_COLUMNS(f, V8_ZERO(), V8_ZERO(), V8_ZERO(), V8_ZERO(), V8_ZERO());
+    FE8_CARRY(out, c0, c1, c2, c3, c4);
+}
+
+/* Bring an element with limbs below 2^63 back to weak or to tight form. */
+AVX512_INLINE void fe8_weak(fe8 *a)
+{
+    __m512i c0 = a->l[0], c1 = a->l[1], c2 = a->l[2], c3 = a->l[3], c4 = a->l[4];
+    FE8_CARRY(a, c0, c1, c2, c3, c4);
+}
+
+AVX512_INLINE void fe8_tight(fe8 *a)
+{
+    __m512i c0 = a->l[0], c1 = a->l[1], c2 = a->l[2], c3 = a->l[3], c4 = a->l[4];
+    FE8_CARRY_TIGHT(a, c0, c1, c2, c3, c4);
+}
+
+/* An out-of-line copy for the few products a window needs outside its loops. */
+AVX512_FN static NOINLINE void fe8_mul_call(fe8 *out, const fe8 *f, const fe8 *g)
+{
+    fe8_mul(out, f, g);
+}
+
+/*
+ * out = 1 / z in every lane; z weak, out weak.  Returns the lanes in which
+ * z is zero and out means nothing.
+ *
+ * An inversion is a chain of 265 operations, each waiting for the one
+ * before, and eight lanes side by side do not make it shorter.  The scalar
+ * code runs such a chain faster, and the trick that serves a window serves
+ * its lanes as well: invert the product of all eight once, then take it
+ * apart again.
+ */
+AVX512_FN static NOINLINE unsigned fe8_invert_lanes(fe8 *out, const fe8 *z)
+{
+    uint64_t limbs[5][8];
+    fe v[8], pre[8], inv, t;
+    unsigned zero = 0;
+
+    fe8_store(&limbs[0][0], z);
+    for (int l = 0; l < 8; l++) {
+        for (int k = 0; k < 5; k++)
+            v[l].v[k] = limbs[k][l];
+        if (fe_is_zero(&v[l])) {
+            zero |= 1u << l;
+            v[l] = FE_ONE;                  /* so that the product serves the other lanes */
+        }
+        if (l == 0)
+            pre[0] = v[0];
+        else
+            fe_mul(&pre[l], &pre[l - 1], &v[l]);
+    }
+    fe_invert(&inv, &pre[7]);
+    for (int l = 7; l >= 1; l--) {
+        fe_mul(&t, &inv, &pre[l - 1]);      /* 1 / v[l] */
+        fe_mul(&inv, &inv, &v[l]);
+        v[l] = t;
+    }
+    v[0] = inv;
+    for (int l = 0; l < 8; l++)
+        for (int k = 0; k < 5; k++)
+            limbs[k][l] = v[l].v[k];
+    fe8_load(out, &limbs[0][0]);
+    fe8_weak(out);
+    return zero;
+}
+
+/*
+ * Exact canonical encoding for the rare element FE8_FINISH cannot complete:
+ * hand each lane to the scalar code.  h holds five limbs below 2^60.
+ */
+AVX512_FN static NOINLINE void fe8_to_words_slow(__m512i w[4], const __m512i h[5])
+{
+    uint64_t limbs[5][8], words[4][8];
+
+    for (int k = 0; k < 5; k++)
+        V8_STORE(limbs[k], h[k]);
+    for (int l = 0; l < 8; l++) {
+        uint64_t out[4];
+        fe t;
+        for (int k = 0; k < 5; k++)
+            t.v[k] = limbs[k][l];
+        fe_to_words(out, &t);
+        for (int k = 0; k < 4; k++)
+            words[k][l] = out[k];
+    }
+    for (int k = 0; k < 4; k++)
+        w[k] = V8_LOAD(words[k]);
+}
+
+/*
+ * Turn five columns (each < 2^63) into canonical words: w[k] receives word k
+ * of every lane.
+ *
+ * Wrapping the top column's excess around first (2^255 = 19) and then
+ * carrying once from limb 0 up to limb 4 leaves limbs 0..3 exact and limb 4
+ * below 2^51 + 2^12.  That is already the canonical value unless limb 4
+ * overflowed or limb 0 is within 19 of 2^51, the only cases in which a carry
+ * is pending or the value can reach p.  Both are rare (about 2^-39 a vector)
+ * and take the slow, exact path.
+ */
+#define FE8_FINISH(w, c0, c1, c2, c3, c4)                                   \
+    do {                                                                    \
+        const __m512i mask51_ = V8_SET1(MASK51);                            \
+        unsigned rare_;                                                     \
+        c0 = _mm512_madd52lo_epu64(c0, V8_SHR(c4, 51), V8_SET1(19));        \
+        c4 = V8_AND(c4, mask51_);                                           \
+        FE8_STEP(c0, c1); FE8_STEP(c1, c2); FE8_STEP(c2, c3); FE8_STEP(c3, c4); \
+        rare_ = (unsigned)_mm512_cmpgt_epu64_mask(c0, V8_SET1(MASK51 - 19)) | \
+                (unsigned)_mm512_cmpgt_epu64_mask(c4, mask51_);             \
+        if (UNLIKELY(rare_ != 0)) {                                         \
+            const __m512i limbs_[5] = {c0, c1, c2, c3, c4};                 \
+            fe8_to_words_slow(w, limbs_);                                   \
+        } else {                                                            \
+            (w)[0] = V8_OR(c0, V8_SHL(c1, 51));                             \
+            (w)[1] = V8_OR(V8_SHR(c1, 13), V8_SHL(c2, 38));                 \
+            (w)[2] = V8_OR(V8_SHR(c2, 26), V8_SHL(c3, 25));                 \
+            (w)[3] = V8_OR(V8_SHR(c3, 39), V8_SHL(c4, 12));                 \
+        }                                                                   \
+    } while (0)
+
+/* canonical words of x; limbs of x below 2^63 */
+AVX512_INLINE void fe8_to_words(__m512i w[4], const fe8 *x)
+{
+    __m512i c0 = x->l[0], c1 = x->l[1], c2 = x->l[2], c3 = x->l[3], c4 = x->l[4];
+    FE8_FINISH(w, c0, c1, c2, c3, c4);
+}
+
+/*
+ * canonical words of f^2 + e, the last step of every key: the addition rides
+ * on the square's carry chain.  f weak, limbs of e below 2^60.
+ */
+AVX512_INLINE void fe8_sq_add_to_words(__m512i w[4], const fe8 *f, const fe8 *e)
+{
+    FE8_SQ_COLUMNS(f, e->l[0], e->l[1], e->l[2], e->l[3], e->l[4]);
+    FE8_FINISH(w, c0, c1, c2, c3, c4);
+}
+
+/* ---- CRC-32 of eight messages at a time, four per 512-bit multiplication ---- */
+
+#define CRC_Z_SHR8(x) _mm512_unpackhi_epi64((x), _mm512_setzero_si512())
+#define CRC_Z_SHL1(x) _mm512_slli_epi64((x), 1)
+#define CRC_REDUCE_Z(T, X01, X23, KA, KB, KC)                                       \
+    CRC_REDUCE(T, X01, X23, KA, KB, KC, _mm512_clmulepi64_epi128, _mm512_xor_si512, \
+               CRC_Z_SHR8, CRC_Z_SHL1)
+
+typedef struct {
+    __m512i ka, kb, kc;             /* the constants of CRC_REDUCE in every 128-bit part */
+    __m512i pick;                   /* gathers the eight results                         */
+    __m256i zero32;
+} crc8_consts;
+
+AVX512_INLINE void crc8_setup(crc8_consts *c)
+{
+    c->ka = _mm512_broadcast_i32x4(_mm_set_epi64x((long long)CRC_K1, (long long)CRC_K0));
+    c->kb = _mm512_broadcast_i32x4(_mm_set_epi64x((long long)CRC_MU, (long long)CRC_K2));
+    c->kc = _mm512_broadcast_i32x4(_mm_set_epi64x(0, (long long)CRC_P1));
+    c->pick = _mm512_setr_epi64(0, 2, 4, 6, 0, 2, 4, 6);
+    c->zero32 = _mm256_set1_epi32((int)CRC_ZERO32);
+}
+
+/* The node IDs of the eight keys whose word k is w[k]: lane l's ID in 32-bit element l. */
+AVX512_INLINE __m256i crc8_words(const crc8_consts *c, const __m512i w[4])
+{
+    /* each 128-bit part holds [W0, W1] or [W2, W3] of one lane: a = lanes 0 2 4 6, b = 1 3 5 7 */
+    const __m512i a01 = _mm512_unpacklo_epi64(w[0], w[1]), a23 = _mm512_unpacklo_epi64(w[2], w[3]);
+    const __m512i b01 = _mm512_unpackhi_epi64(w[0], w[1]), b23 = _mm512_unpackhi_epi64(w[2], w[3]);
+    __m512i ta, tb, r;
+
+    CRC_REDUCE_Z(ta, a01, a23, c->ka, c->kb, c->kc);
+    CRC_REDUCE_Z(tb, b01, b23, c->ka, c->kb, c->kc);
+    /* the CRC is 32-bit element 2 of each part: pair a with b, then gather the four pairs */
+    r = _mm512_unpackhi_epi32(ta, tb);
+    r = _mm512_permutexvar_epi64(c->pick, r);
+    return _mm256_xor_si256(_mm512_castsi512_si256(r), c->zero32);
+}
+
+/* The same from memory, for the tests: grp[g][word][lane] -> out[8g + lane]. */
+AVX512_FN static void crc_groups8(const uint64_t (*grp)[4][8], uint32_t *out, size_t groups)
+{
+    crc8_consts c;
+
+    crc8_setup(&c);
+    for (size_t g = 0; g < groups; g++) {
+        const __m512i w[4] = {V8_LOAD(grp[g][0]), V8_LOAD(grp[g][1]), V8_LOAD(grp[g][2]),
+                              V8_LOAD(grp[g][3])};
+        _mm256_storeu_si256((__m256i *)(void *)(out + 8 * g), crc8_words(&c, w));
+    }
+}
+
+/* ---- the kernel ---- */
+
+/*
+ * The table points of a window are worked through in WALK8_RUNS runs of
+ * equal length, each with its own chain of products.  A multiplication is
+ * so cheap here that the next one could start long before its result is
+ * known, and a single chain would leave the CPU waiting; several of them,
+ * independent of each other, keep it busy.
+ */
+#define WALK8_RUNS 4
+#define WALK8_RUN  (HALF_WINDOW / WALK8_RUNS)
+_Static_assert(HALF_WINDOW % WALK8_RUNS == 0, "the runs must divide the window evenly");
+
+typedef struct {
+    lane_t   lane[8];
+    uint64_t um[5][8], vm[5][8];                    /* window centres: u weak, v tight */
+    uint64_t prefix[WALK8_RUNS][WALK8_RUN + 1][5][8];
+} walk8_t;
+
+static int walk8_available(void)
+{
+    return g_cpu.avx512;
+}
+
+static void walk8_set_centre(void *state, unsigned l, const mpoint *c)
+{
+    walk8_t *w = (walk8_t *)state;
+
+    for (int k = 0; k < 5; k++) {
+        w->um[k][l] = c->u.v[k];
+        w->vm[k][l] = c->v.v[k];
+    }
+}
+
+static void walk8_seed_lane(walk8_t *w, unsigned l)
+{
+    mpoint centre;
+
+    lane_seed(&w->lane[l], &centre);
+    walk8_set_centre(w, l, &centre);
+}
+
+static void walk8_seed(void *state)
+{
+    for (unsigned l = 0; l < 8; l++)
+        walk8_seed_lane((walk8_t *)state, l);
+}
+
+/*
+ * The filter on sixteen keys at once: bit n of the result is set if key n
+ * may be wanted, where keys 0..7 are the lanes of grp[0] and keys 8..15
+ * those of grp[1], and `ids` holds their node IDs in that order.  A group of
+ * one target is a vector comparison; a larger group falls back to one
+ * look-up per key.
+ */
+AVX512_INLINE unsigned filter16(const filter_t *f, const uint64_t (*grp)[4][8], __m512i ids)
+{
+    unsigned hit = 0;
+
+    for (unsigned g = 0; g < f->groups; g++) {
+        const fgroup_t *fg = &f->group[g];
+
+        if (fg->source == SRC_ID) {
+            if (fg->single) {
+                const __m512i v = V8_AND(ids, _mm512_set1_epi32((int)(uint32_t)fg->mask));
+                hit |= (unsigned)_mm512_cmpeq_epi32_mask(
+                    v, _mm512_set1_epi32((int)(uint32_t)fg->value));
+            } else {
+                uint32_t id[16];
+                V8_STORE(id, ids);
+                for (unsigned n = 0; n < 16; n++)
+                    hit |= (unsigned)fgroup_pass(fg, id[n]) << n;
+            }
+        } else {
+            const unsigned k = fg->source;
+
+            if (fg->single) {
+                const __m512i m = V8_SET1(fg->mask), want = V8_SET1(fg->value);
+                hit |= (unsigned)_mm512_cmpeq_epi64_mask(V8_AND(V8_LOAD(grp[0][k]), m), want) |
+                       (unsigned)_mm512_cmpeq_epi64_mask(V8_AND(V8_LOAD(grp[1][k]), m), want) << 8;
+            } else {
+                for (unsigned n = 0; n < 16; n++)
+                    hit |= (unsigned)fgroup_pass(fg, grp[n >> 3][k][n & 7]) << n;
+            }
+        }
+    }
+    return hit;
+}
+
+/*
+ * Follow up the keys the filter let through: bit n of `hit` is lane n & 7 of
+ * grp[n >> 3], which holds candidate j_first or j_second of its lane.  A lane
+ * reports at most one key per base, so once it is retired its later
+ * candidates in the window are dropped.
+ */
+static NOINLINE void walk8_candidates(walk8_t *w, const filter_t *f, unsigned *retired,
+                                      unsigned hit, const uint64_t (*grp)[4][8],
+                                      const uint32_t *id, int have_id, unsigned j_first,
+                                      unsigned j_second)
+{
+    for (unsigned n = 0; n < 16; n++) {
+        const unsigned l = n & 7, g = n >> 3;
+        uint64_t words[4];
+
+        if (!((hit >> n) & 1) || (*retired & (1u << l)))
+            continue;
+        for (int k = 0; k < 4; k++)
+            words[k] = grp[g][k][l];
+        if (engine_candidate(f, &w->lane[l], g == 0 ? j_first : j_second, words, have_id, id[n]))
+            *retired |= 1u << l;
+    }
+}
+
+static NOINLINE void walk8_dump(const walk_dump *dump, const uint64_t grp[4][8],
+                                const uint32_t *id, unsigned j)
+{
+    for (unsigned l = 0; l < 8; l++) {
+        for (int k = 0; k < 4; k++)
+            dump->words[l * WINDOW + j][k] = grp[k][l];
+        dump->id[l * WINDOW + j] = id[l];
+    }
+}
+
+AVX512_FN static void walk8_window(void *state, const walk_dump *dump)
+{
+    walk8_t *w = (walk8_t *)state;
+    const filter_t *const f = filter_current();
+    const int want_id = f->need_id || dump != NULL;
+    fe8 um, vm, bias_u, bias_v, e0, e, p, acc, inv, d, t, tp, tm, lam, lamp, lamm, x, pre;
+    fe8 run[WALK8_RUNS];
+    crc8_consts crc;
+    __m512i wp[4], wm[4], ids = V8_ZERO();
+    _Alignas(64) uint64_t grp[2][4][8];
+    _Alignas(64) uint32_t id[16];
+    unsigned retired, hit;
+
+    crc8_setup(&crc);
+
+    /*
+     * Window constants:
+     *   bias_u = -u_M, tight        u_i - u_M = u_i + bias_u   (limbs < 2^52)
+     *   bias_v = -v_M, tight        v_i - v_M = v_i + bias_v   (limbs < 2^52)
+     *   e0     = 4p - A - u_M       u(M +/- P_i) = lambda^2 + e0 - u_i
+     */
+    fe8_load(&um, &w->um[0][0]);
+    fe8_load(&vm, &w->vm[0][0]);
+    for (int k = 0; k < 5; k++) {
+        bias_u.l[k] = V8_SUB(V8_SET1(TWO_P_51[k]), um.l[k]);
+        bias_v.l[k] = V8_SUB(V8_SET1(TWO_P_51[k]), vm.l[k]);
+        e0.l[k] = V8_SUB(V8_SET1(FOUR_P_51[k]), um.l[k]);
+    }
+    fe8_tight(&bias_u);
+    fe8_tight(&bias_v);
+    e0.l[0] = V8_SUB(e0.l[0], V8_SET1(CURVE_A));
+
+    /*
+     * Forward pass.  Run r covers the table points i = r * WALK8_RUN + j for
+     * j = 1..WALK8_RUN, and
+     *     prefix[r][j] = (u_Q - u_M) * (u_i - u_M) * ...   over the first j of them.
+     * Every run starts from u_Q - u_M, so every run ends, in the backward
+     * pass, with the inverse that moving the centre needs.
+     */
+    for (int k = 0; k < 5; k++)
+        p.l[k] = V8_ADD(V8_SET1(TABQ.u.v[k]), bias_u.l[k]);
+    for (int r = 0; r < WALK8_RUNS; r++)
+        fe8_store(&w->prefix[r][0][0][0], &p);
+    for (int j = 1; j <= WALK8_RUN; j++) {
+        for (int r = 0; r < WALK8_RUNS; r++) {
+            const mpoint *const pt = &TAB[r * WALK8_RUN + j];
+
+            fe8_load(&p, &w->prefix[r][j - 1][0][0]);
+            for (int k = 0; k < 5; k++)
+                d.l[k] = V8_ADD(V8_SET1(pt->u.v[k]), bias_u.l[k]);
+            fe8_mul(&p, &p, &d);
+            fe8_store(&w->prefix[r][j][0][0], &p);
+        }
+    }
+
+    /*
+     * Invert the product of all the runs once and share the inverse out
+     * among them, by the same trick one level up:  run[r] = 1 / prefix[r][last].
+     * A lane whose product is zero met a table point: its results are void.
+     */
+    fe8_load(&run[0], &w->prefix[0][WALK8_RUN][0][0]);
+    for (int r = 1; r < WALK8_RUNS; r++) {
+        fe8_load(&p, &w->prefix[r][WALK8_RUN][0][0]);
+        fe8_mul_call(&run[r], &run[r - 1], &p);
+    }
+    retired = fe8_invert_lanes(&acc, &run[WALK8_RUNS - 1]);
+    for (int r = WALK8_RUNS - 1; r >= 1; r--) {
+        fe8_load(&p, &w->prefix[r][WALK8_RUN][0][0]);
+        fe8_mul_call(&run[r], &acc, &run[r - 1]);
+        fe8_mul_call(&acc, &acc, &p);
+    }
+    run[0] = acc;
+
+    /* Backward pass: one inverse per step, sixteen keys out. */
+    for (int r = WALK8_RUNS - 1; r >= 0; r--) {
+        acc = run[r];
+        for (int j = WALK8_RUN; j >= 1; j--) {
+            const unsigned i = (unsigned)(r * WALK8_RUN + j);
+            const mpoint *const pt = &TAB[i];
+
+            fe8_load(&pre, &w->prefix[r][j - 1][0][0]);
+            fe8_mul(&inv, &acc, &pre);              /* 1 / (u_i - u_M) */
+            for (int k = 0; k < 5; k++) {
+                const __m512i ui = V8_SET1(pt->u.v[k]), vi = V8_SET1(pt->v.v[k]);
+                d.l[k] = V8_ADD(ui, bias_u.l[k]);
+                e.l[k] = V8_SUB(e0.l[k], ui);
+                tp.l[k] = V8_ADD(vi, bias_v.l[k]);  /* v_i - v_M */
+                tm.l[k] = V8_ADD(vi, vm.l[k]);      /* v_i + v_M */
+            }
+            fe8_mul(&acc, &acc, &d);
+
+            /* M + P_i and M - P_i side by side: neither has to wait for the other */
+            fe8_mul(&lamp, &inv, &tp);
+            fe8_mul(&lamm, &inv, &tm);
+            fe8_sq_add_to_words(wp, &lamp, &e);
+            fe8_sq_add_to_words(wm, &lamm, &e);
+            for (int k = 0; k < 4; k++) {
+                V8_STORE(grp[0][k], wp[k]);
+                V8_STORE(grp[1][k], wm[k]);
+            }
+            if (want_id)
+                ids = _mm512_inserti64x4(_mm512_castsi256_si512(crc8_words(&crc, wp)),
+                                         crc8_words(&crc, wm), 1);
+
+            hit = filter16(f, (const uint64_t (*)[4][8])grp, ids);
+            if (UNLIKELY(hit != 0 || dump != NULL)) {
+                V8_STORE(id, ids);
+                if (dump != NULL) {
+                    walk8_dump(dump, (const uint64_t (*)[8])grp[0], id, HALF_WINDOW + i);
+                    walk8_dump(dump, (const uint64_t (*)[8])grp[1], id + 8, HALF_WINDOW - i);
+                }
+                if (hit != 0)
+                    walk8_candidates(w, f, &retired, hit, (const uint64_t (*)[4][8])grp, id,
+                                     want_id, HALF_WINDOW + i, HALF_WINDOW - i);
+            }
+        }
+    }
+
+    /* The centres themselves. */
+    fe8_to_words(wp, &um);
+    for (int k = 0; k < 4; k++)
+        V8_STORE(grp[0][k], wp[k]);
+    if (want_id)
+        ids = _mm512_inserti64x4(V8_ZERO(), crc8_words(&crc, wp), 0);
+    hit = filter16(f, (const uint64_t (*)[4][8])grp, ids) & 0xffu;     /* grp[1] is stale here */
+    if (UNLIKELY(hit != 0 || dump != NULL)) {
+        V8_STORE(id, ids);
+        if (dump != NULL)
+            walk8_dump(dump, (const uint64_t (*)[8])grp[0], id, HALF_WINDOW);
+        if (hit != 0)
+            walk8_candidates(w, f, &retired, hit, (const uint64_t (*)[4][8])grp, id, want_id,
+                             HALF_WINDOW, HALF_WINDOW);
+    }
+
+    /* Move every centre: M' = M + Q, with acc = 1 / (u_Q - u_M). */
+    for (int k = 0; k < 5; k++)
+        t.l[k] = V8_ADD(V8_SET1(TABQ.v.v[k]), bias_v.l[k]);
+    fe8_mul(&lam, &acc, &t);
+    fe8_sq(&x, &lam);
+    for (int k = 0; k < 5; k++)
+        x.l[k] = V8_ADD(x.l[k], V8_SUB(e0.l[k], V8_SET1(TABQ.u.v[k])));
+    fe8_weak(&x);                                   /* u' = lambda^2 - A - u_M - u_Q */
+    for (int k = 0; k < 5; k++)
+        d.l[k] = V8_ADD(um.l[k], V8_SUB(V8_SET1(TWO_P_51[k]), x.l[k]));
+    fe8_weak(&d);                                   /* u_M - u' */
+    fe8_mul(&t, &d, &lam);
+    for (int k = 0; k < 5; k++)
+        t.l[k] = V8_ADD(t.l[k], bias_v.l[k]);
+    fe8_tight(&t);                                  /* v' = lambda * (u_M - u') - v_M */
+    fe8_store(&w->um[0][0], &x);
+    fe8_store(&w->vm[0][0], &t);
+
+    for (unsigned l = 0; l < 8; l++) {
+        if ((retired >> l) & 1 || w->lane[l].win + 1 >= LANE_MAX_WINDOWS)
+            walk8_seed_lane(w, l);
+        else
+            w->lane[l].win++;
+    }
+}
+
+static const backend_t BACKEND_AVX512 = {
+    "avx512", 8, sizeof(walk8_t), walk8_available, walk8_seed, walk8_window, walk8_set_centre,
+    WALK8_RUNS,
+};
+
+#endif /* MTV_X86 */
+
+#ifdef MTV_CUDA
+#  include "mtvanity_cuda.h"         /* the optional GPU backend */
+#endif
+
 static const backend_t *const BACKENDS[] = {
     /* usually-fastest first; a tie in calibration goes to the earlier entry */
+#ifdef MTV_CUDA
+    &BACKEND_CUDA,
+#endif
 #ifdef MTV_X86
+    &BACKEND_AVX512,
     &BACKEND_AVX2,
 #endif
     &BACKEND_SCALAR,
@@ -3426,7 +4123,7 @@ static const backend_t *backend_find(const char *name)
 }
 
 /* ======================================================================== */
-/* 11. Worker threads and the run loop                                       */
+/* 12. Worker threads and the run loop                                       */
 /* ======================================================================== */
 
 typedef struct {
@@ -3434,6 +4131,10 @@ typedef struct {
     const backend_t *forced;                /* NULL: measure and choose           */
     const backend_t *chosen;                /* the kernel the thread settled on   */
     int cpu_slot;                           /* >= 0: bind the thread to that CPU  */
+#ifdef MTV_CUDA
+    int parkable;                           /* stops when the GPU takes over      */
+    int timed;                              /* g_cuda.retime when it timed the kernels */
+#endif
     thread_t thread;
 } worker_t;
 
@@ -3455,13 +4156,38 @@ static double worker_search(worker_t *wk, const backend_t *be, double seconds)
     be->seed(state);
     start = now_seconds();
     while (!atomic_load_explicit(&g_run.stop, memory_order_relaxed)) {
+#ifdef MTV_CUDA
+        if (wk->parkable && atomic_load_explicit(&g_cuda.park, memory_order_relaxed)) {
+            if (seconds > 0.0)
+                break;                          /* timing a kernel: nothing to time now */
+            sleep_ms(20);                       /* the GPU has the search, and may hand it back */
+            continue;
+        }
+        if (!(seconds > 0.0) && wk->forced == NULL &&
+            wk->timed != atomic_load_explicit(&g_cuda.retime, memory_order_relaxed))
+            break;                              /* worker_main times the kernels again */
+#endif
         be->window(state, NULL);
+#ifdef MTV_CUDA
+        if (be == &BACKEND_CUDA) {              /* a launch, not a window: it says how many keys */
+            const unsigned long long did = ((const cuda_walk_t *)state)->last_keys;
+            atomic_fetch_add_explicit(&wk->keys, did, memory_order_relaxed);
+            done += did;
+            if (seconds > 0.0 && (elapsed = now_seconds() - start) >= seconds)
+                break;
+            continue;
+        }
+#endif
         atomic_fetch_add_explicit(&wk->keys, per_window, memory_order_relaxed);
         done += per_window;
         os_yield();
         if (seconds > 0.0 && (elapsed = now_seconds() - start) >= seconds)
             break;
     }
+#ifdef MTV_CUDA
+    if (be == &BACKEND_CUDA)
+        cuda_drain(state);
+#endif
     secure_zero(state, be->state_size);
     xfree_aligned(state);
     return elapsed > 0.0 ? (double)done / elapsed : 0.0;
@@ -3481,10 +4207,19 @@ static void worker_main(void *arg)
 
     if (wk->cpu_slot >= 0)
         os_pin_thread(wk->cpu_slot);
+#ifdef MTV_CUDA
+again:
+    best = wk->forced;
+    wk->timed = atomic_load(&g_cuda.retime);
+#endif
     if (best == NULL) {
         double best_rate = -1.0;
         for (size_t i = 0; i < ARRAY_LEN(BACKENDS); i++) {
             double rate;
+#ifdef MTV_CUDA
+            if (BACKENDS[i] == &BACKEND_CUDA)       /* the GPU has its own worker */
+                continue;
+#endif
             if (!BACKENDS[i]->available())
                 continue;
             rate = worker_search(wk, BACKENDS[i], CALIBRATION_SECONDS);
@@ -3496,6 +4231,16 @@ static void worker_main(void *arg)
     }
     wk->chosen = best;
     (void)worker_search(wk, best, 0.0);
+#ifdef MTV_CUDA
+    /*
+     * Beside a GPU the first choice can be wrong: the kernels were timed while
+     * the driver started, which takes much of the CPU for a second or two.
+     * When that is over, engine_run has the threads that go on searching time
+     * their kernels once more.
+     */
+    if (wk->forced == NULL && !atomic_load(&g_run.stop))
+        goto again;
+#endif
 }
 
 /* A key count for people: "65.5 thousand", "1.72 billion". */
@@ -3518,6 +4263,15 @@ static void format_count(char *out, size_t n, double count)
         snprintf(out, n, "%.0f", v);
     else
         snprintf(out, n, "%.*f%s", v < 9.995 ? 2 : v < 99.95 ? 1 : 0, v, unit[u]);
+}
+
+/* A speed for people: "7.20 billion keys/s". */
+static void format_rate(char *out, size_t n, double rate)
+{
+    char count[40];
+
+    format_count(count, sizeof count, rate);
+    snprintf(out, n, "%s keys/s", count);
 }
 
 #define SECONDS_PER_YEAR 31557600.0
@@ -3546,6 +4300,7 @@ typedef struct {
     int threads;
     char kernels[64];                       /* e.g. "avx2 x16, scalar x16" */
     double terminal_wait;                   /* the longest handing over one status line took */
+    double rate;                            /* keys per second once the run had settled      */
 } run_result;
 
 /*
@@ -3556,7 +4311,11 @@ typedef struct {
 static run_result engine_run(const backend_t *be, int nthreads, int pin, double time_limit,
                              unsigned long long key_limit, int show_progress)
 {
-    run_result res = {0, 0.0, 0, "", 0.0};
+    run_result res = {0, 0.0, 0, "", 0.0, 0.0};
+    /* for the benchmark: the speed after start-up, between two moments at which keys came in */
+    const double warm = time_limit * 0.2 < 0.5 ? 0.5 : time_limit * 0.2 > 5.0 ? 5.0 : time_limit * 0.2;
+    unsigned long long seen_keys = 0, mark_keys = 0, last_keys = 0;
+    double mark_time = 0.0, last_time = 0.0;
     /* on a terminal one line is redrawn in place; a file or a pipe gets a line now and then */
     const int live = show_progress && os_stderr_columns() > 0;
     double expected = 0.0, start, last_report, log_at = PROGRESS_LOG_SECONDS;
@@ -3571,12 +4330,44 @@ static run_result engine_run(const backend_t *be, int nthreads, int pin, double 
     if (g_targets > 0)
         filter_publish();
 
+#ifdef MTV_CUDA
+    /*
+     * Worker 0 feeds the GPU.  Under auto the CPU threads start with it and
+     * search while it comes up; when it has taken its first launch they stop,
+     * unless the user asked for CPU threads beside it (--threads).
+     */
+    const int gpu = be == &BACKEND_CUDA || (be == NULL && g_cuda.auto_on);
+    const int cpu_threads = nthreads;       /* what the CPU gets if the GPU fails */
+    int handed = 0, lost = 0, more = 0, spare = 0;
+    if (gpu)
+        nthreads = be != NULL ? 1 : nthreads < MAX_THREADS ? nthreads + 1 : MAX_THREADS;
+    g_cuda.async = gpu && be == NULL;
+    if (g_cuda.async) {
+        spare = cuda_spare(cpu_threads);    /* these wait, and the first CPUs stay free for the driver */
+        nthreads -= spare;
+    }
+    g_cuda.say = show_progress;
+    g_cuda.rate = 0.0;
+    atomic_store(&g_cuda.ran, 0);
+    atomic_store(&g_cuda.park, 0);
+    atomic_store(&g_cuda.up, 0);
+    atomic_store(&g_cuda.lost, 0);
+    atomic_store(&g_cuda.none, 0);
+    atomic_store(&g_cuda.retime, 0);
+#endif
     for (int i = 0; i < nthreads; i++) {
         worker_t *wk = &g_workers[i];
         atomic_store(&wk->keys, 0);
         wk->forced = be;
         wk->chosen = NULL;
         wk->cpu_slot = pin ? i : -1;
+#ifdef MTV_CUDA
+        if (gpu) {
+            wk->forced = i == 0 ? &BACKEND_CUDA : NULL;
+            wk->cpu_slot = pin && i > 0 ? (i - 1 + spare) % cpu_threads : -1;
+        }
+        wk->parkable = gpu && i > 0 && g_cuda.cpu_join == 0;
+#endif
         wk->thread.fn = worker_main;
         wk->thread.arg = wk;
         if (thread_start(&wk->thread) != 0)
@@ -3598,19 +4389,118 @@ static run_result engine_run(const backend_t *be, int nthreads, int pin, double 
             res.keys += atomic_load_explicit(&g_workers[i].keys, memory_order_relaxed);
         now = now_seconds();
         res.seconds = now - start;
+        if (res.keys != seen_keys) {
+            seen_keys = res.keys;
+            if (mark_time == 0.0 && res.seconds >= warm) {
+                mark_time = now;
+                mark_keys = res.keys;
+            }
+            last_time = now;
+            last_keys = res.keys;
+        }
         if ((key_limit != 0 && res.keys >= key_limit) ||
             (time_limit > 0.0 && res.seconds >= time_limit))
             atomic_store(&g_run.stop, 1);
         if (atomic_load(&g_run.stop))
             break;
+#ifdef MTV_CUDA
+        if (g_cuda.async && !handed && atomic_load(&g_cuda.ran)) {
+            /*
+             * The GPU is searching: hand over to it, unless the CPU threads are
+             * about to finish anyway, or the GPU is not clearly faster than they
+             * are, as a small GPU beside a big CPU may not be.
+             */
+            unsigned long long cpu_keys = 0;
+            double left = 1e30, cpu_rate = 0.0;
+            int behind;
+
+            handed = 1;
+            for (int i = 1; i < res.threads; i++)
+                cpu_keys += atomic_load_explicit(&g_workers[i].keys, memory_order_relaxed);
+            if (res.seconds > 0.0)
+                cpu_rate = (double)cpu_keys / res.seconds;
+            behind = g_cuda.rate < CUDA_PARK_MIN * cpu_rate;
+            output_lock();
+            if (g_targets > 0 && cpu_keys > 0)
+                left = targets_expected_keys() * res.seconds / (double)cpu_keys;
+            if (g_cuda.cpu_join == 0 && left >= 1.0 && !behind)
+                atomic_store(&g_cuda.park, 1);
+            else
+                more = 1;                       /* the CPU threads search on beside it */
+            if (show_progress) {
+                progress_clear();
+                if (g_cuda.cpu_join == 0 && left >= 1.0 && behind) {
+                    char gpu_speed[48], cpu_speed[48];
+                    format_rate(gpu_speed, sizeof gpu_speed, g_cuda.rate);
+                    format_rate(cpu_speed, sizeof cpu_speed, cpu_rate);
+                    err_printf("GPU ready after %.2f s (%s, %u walks); at %s it is not clearly faster "
+                               "than the CPU threads (%s), so they keep searching beside it\n",
+                               res.seconds, g_cuda.name, g_cuda.lanes, gpu_speed, cpu_speed);
+                } else {
+                    err_printf("GPU ready after %.2f s (%s, %u walks)%s\n", res.seconds, g_cuda.name,
+                               g_cuda.lanes, atomic_load(&g_cuda.park) ? "; the CPU threads stop" : "");
+                }
+            }
+            if (getenv("MTV_CUDA_TIMING") != NULL)
+                err_printf("GPU start-up: driver %.3f, context %.3f, kernel %.3f, buffers %.3f, tables %.3f, "
+                           "seeding %.3f, check %.3f s; first launch done %.3f s into the search\n",
+                           g_cuda.ph[0], g_cuda.ph[1], g_cuda.ph[2], g_cuda.ph[3], g_cuda.ph[4],
+                           g_cuda.ph[5], g_cuda.ph[6], res.seconds);
+            output_unlock();
+        }
+        if (g_cuda.async && !handed && atomic_load(&g_cuda.none)) {
+            handed = 1;                         /* no GPU after all: the CPU threads search on */
+            more = 1;
+        }
+        if (gpu && !lost && atomic_load(&g_cuda.lost)) {
+            /*
+             * The GPU failed partway.  The CPU threads that stood down search
+             * again; under --backend cuda there were none, so they start now.
+             * A benchmark line is left as it is: it measures the GPU.
+             */
+            lost = 1;
+            atomic_store(&g_cuda.park, 0);
+            output_lock();
+            progress_clear();
+            err_printf("mtvanity: warning: the GPU stopped working (%s); the CPU takes over the search\n",
+                       g_cuda.lost_why);
+            output_unlock();
+            if (be == NULL || time_limit == 0.0)
+                more = 1;
+        }
+        if (more) {
+            /*
+             * The GPU's start-up is over and CPU threads search on.  Those
+             * that were running time their kernels again: the first timing
+             * ran beside the driver's start.  Those that have not started
+             * yet start now.
+             */
+            more = 0;
+            atomic_fetch_add(&g_cuda.retime, 1);
+            for (int i = res.threads; i <= cpu_threads && i < MAX_THREADS; i++) {
+                worker_t *wk = &g_workers[i];
+                atomic_store(&wk->keys, 0);
+                wk->forced = NULL;
+                wk->chosen = NULL;
+                wk->cpu_slot = pin ? (i - 1 + spare) % cpu_threads : -1;
+                wk->parkable = 0;
+                wk->thread.fn = worker_main;
+                wk->thread.arg = wk;
+                if (thread_start(&wk->thread) != 0)
+                    break;
+                res.threads++;
+            }
+        }
+#endif
 
         if (show_progress && now - last_report >= 1.0 && res.keys > 0) {
             const double rate = (double)res.keys / res.seconds;
             status_t line = {"", live ? progress_limit() : PROGRESS_COLUMNS, 0};
             double waited = now_seconds() - now;    /* for the terminal to say how wide it is */
-            char count[40], mean[40], p95[40];
+            char count[40], mean[40], p95[40], speed[48];
 
             format_count(count, sizeof count, (double)res.keys);
+            format_rate(speed, sizeof speed, rate);
             output_lock();
             if (g_run.hits != estimated_at) {       /* a key was found: the outlook changed */
                 estimated_at = g_run.hits;
@@ -3621,7 +4511,7 @@ static run_result engine_run(const backend_t *be, int nthreads, int pin, double 
                 status_add(&line, "%" PRIu64 " of %" PRIu64 " found", g_run.hits,
                            g_run.hits_wanted);
             status_add(&line, "%s%s keys", line.text[0] != '\0' ? ", " : "", count);
-            status_add(&line, ", %.1f M/s", rate / 1e6);
+            status_add(&line, ", %s", speed);
             if (g_run.hits_wanted != 1) {
                 status_add(&line, ", about %s more on average", mean);
             } else if (expected / rate > LONG_SEARCH_SECONDS) {
@@ -3672,18 +4562,36 @@ static run_result engine_run(const backend_t *be, int nthreads, int pin, double 
         }
     }
 
-    for (int i = 0; i < res.threads; i++)
+    for (int i = 0; i < res.threads; i++) {
+#ifdef MTV_CUDA
+        if (i == 0 && g_cuda.async && !atomic_load(&g_cuda.up)) {
+            g_cuda.orphan = 1;                  /* still starting the driver: the search does not wait for it */
+            continue;
+        }
+#endif
         thread_join(&g_workers[i].thread);
+    }
     res.keys = 0;
     for (int i = 0; i < res.threads; i++)
         res.keys += atomic_load(&g_workers[i].keys);
     res.seconds = now_seconds() - start;
+    res.rate = mark_time > 0.0 && last_time > mark_time
+                   ? (double)(last_keys - mark_keys) / (last_time - mark_time)
+                   : res.seconds > 0.0 ? (double)res.keys / res.seconds : 0.0;
     progress_clear();
     filter_reset();
 
+#ifdef MTV_CUDA
+    if (gpu && !atomic_load(&g_cuda.ran) && !g_cuda.orphan)
+        g_workers[0].chosen = NULL;             /* the search ended before the GPU was ready */
+    g_cuda.async = 0;
+#endif
     for (size_t b = 0; b < ARRAY_LEN(BACKENDS); b++) {
         int n = 0;
         for (int i = 0; i < res.threads; i++)
+#ifdef MTV_CUDA
+            if (i > 0 || !g_cuda.orphan)        /* a GPU worker left inside the driver is not counted */
+#endif
             n += g_workers[i].chosen == BACKENDS[b];
         if (n > 0) {
             const size_t used = strlen(res.kernels);
@@ -3695,7 +4603,7 @@ static run_result engine_run(const backend_t *be, int nthreads, int pin, double 
 }
 
 /* ======================================================================== */
-/* 12. Self-tests                                                            */
+/* 13. Self-tests                                                            */
 /* ======================================================================== */
 
 static int t_failures;
@@ -3714,7 +4622,10 @@ static void t_check(int ok, const char *fmt, ...)
     va_start(ap, fmt);
     vsnprintf(what, sizeof what, fmt, ap);
     va_end(ap);
-    out_printf("  %s  %s\n", ok ? "ok  " : "FAIL", what);
+    if (t_verbose)
+        out_printf("  %s  %s\n", ok ? "ok  " : "FAIL", what);
+    else                                    /* the check before a search: stdout is for keys */
+        err_printf("  %s  %s\n", ok ? "ok  " : "FAIL", what);
 }
 
 static void t_x25519(const char *name, const char *k_hex, const char *u_hex, const char *want_hex)
@@ -4338,9 +5249,34 @@ AVX2_FN static int t_filter8(const filter_t *f)
     }
     return filter8(f, (const uint64_t (*)[4][4])grp, id) != want;
 }
+
+/* The same for the sixteen keys of the AVX-512 kernel. */
+AVX512_FN static int t_filter16(const filter_t *f)
+{
+    uint64_t grp[2][4][8];
+    uint32_t id[16];
+    uint8_t coin[16];
+    unsigned want = 0;
+
+    os_random(coin, sizeof coin);
+    for (unsigned n = 0; n < 16; n++) {
+        uint64_t w[4];
+        uint8_t pk[32];
+
+        t_random_key(pk, &id[n]);
+        if (g_targets > 0 && (coin[n] & 1))
+            t_plant(&g_target[coin[n] % (unsigned)g_targets], pk, &id[n]);
+        t_words(w, pk);
+        for (int k = 0; k < 4; k++)
+            grp[n >> 3][k][n & 7] = w[k];
+        want |= (unsigned)filter_pass(f, w, id[n]) << n;
+    }
+    return filter16(f, (const uint64_t (*)[4][8])grp, V8_LOAD(id)) != want;
+}
 #endif
 
-static void test_filter(int full)
+/* `only`: the kernel the user asked for; the vector code of the others is left alone. */
+static void test_filter(int full, const backend_t *only)
 {
     static const struct {
         const char *spec;
@@ -4364,6 +5300,12 @@ static void test_filter(int full)
     const int rounds = full ? 400 : 16;
     filter_t *f = (filter_t *)xalloc_aligned(sizeof *f);
     int bad_shape = 0, missed = 0, kept = 0, bad_vector = 0;
+#ifdef MTV_X86
+    const int vector4 = walk4_available() && (only == NULL || only == &BACKEND_AVX2);
+    const int vector8 = walk8_available() && (only == NULL || only == &BACKEND_AVX512);
+#else
+    (void)only;
+#endif
 
     for (size_t s = 0; s < ARRAY_LEN(sets); s++) {
         if (!t_targets(sets[s].spec, 0)) {
@@ -4387,16 +5329,18 @@ static void test_filter(int full)
                 missed += !filter_pass(f, w, id) || !t_filter_claims(f, k, w, id);
         }
 #ifdef MTV_X86
-        if (walk4_available())
-            for (int i = 0; i < rounds; i++)
-                bad_vector += t_filter8(f);
+        for (int i = 0; i < rounds && vector4; i++)
+            bad_vector += t_filter8(f);
+        for (int i = 0; i < rounds && vector8; i++)
+            bad_vector += t_filter16(f);
 #endif
     }
     t_check(bad_shape == 0, "filter: targets are grouped as intended, with and without node IDs");
     t_check(missed == 0, "filter: no key that a target wants is filtered out");
 #ifdef MTV_X86
-    if (walk4_available())
-        t_check(bad_vector == 0, "filter: the vector form agrees with the scalar form");
+    if (vector4 || vector8)
+        t_check(bad_vector == 0, "filter: the vector form%s with the scalar form",
+                vector4 && vector8 ? "s agree" : " agrees");
 #else
     (void)bad_vector;
 #endif
@@ -4426,9 +5370,85 @@ static void test_filter(int full)
 }
 
 /*
+ * Plant a target on one key of the window a lane is about to search and run
+ * just that window: the key must come out, and under its own scalar.  Then
+ * plant two targets in one window of one lane: only one key may come out,
+ * because a base is finished with its first hit, and the lane must go on
+ * with a fresh base.  `state` is a walk that is under way.
+ */
+static void test_planted(const backend_t *be, void *state, int full)
+{
+#define T_NOWHERE WINDOW
+    static const unsigned plant[][2] = {
+        {HALF_WINDOW, T_NOWHERE},                       /* these two at every start as well */
+        {HALF_WINDOW + 100, HALF_WINDOW - 100},
+        /* single keys: the ends of a window, around its centre, where parts of the table meet */
+        {0, T_NOWHERE}, {WINDOW - 1, T_NOWHERE}, {1, T_NOWHERE}, {WINDOW - 2, T_NOWHERE},
+        {HALF_WINDOW - 1, T_NOWHERE}, {HALF_WINDOW + 1, T_NOWHERE},
+        {HALF_WINDOW + HALF_WINDOW / 4, T_NOWHERE}, {HALF_WINDOW + HALF_WINDOW / 4 + 1, T_NOWHERE},
+        {HALF_WINDOW - HALF_WINDOW / 2, T_NOWHERE}, {HALF_WINDOW - HALF_WINDOW / 2 - 1, T_NOWHERE},
+        /* pairs: on either side of the centre in either order, and the centre itself */
+        {3, WINDOW - 7}, {WINDOW - 4, 6}, {HALF_WINDOW, 77}, {HALF_WINDOW + 5, HALF_WINDOW},
+    };
+    const size_t rounds = full ? ARRAY_LEN(plant) : 2;
+    const out_mode_t saved_mode = g_run.mode;
+    hit_t hits[2];
+    int bad = 0;
+
+    g_run.mode = OUT_CAPTURE;
+    g_run.capture = hits;
+    for (size_t n = 0; n < rounds; n++) {
+        const unsigned l = be->lanes - 1 - (unsigned)n % be->lanes;
+        const int planted = plant[n][1] == T_NOWHERE ? 1 : 2;
+        lane_t before, after;
+        uint8_t sk[2][32];
+        int refused = 0;
+
+        memcpy(&before, (const lane_t *)state + l, sizeof before);
+        targets_clear();
+        for (int k = 0; k < planted; k++) {
+            uint8_t pk[32];
+            char spec[40], hex[9];
+
+            scalar_offset(sk[k], before.base, before.win * WINDOW + plant[n][k]);
+            x25519_ref(pk, sk[k], BASE_U);
+            hex_encode(hex, pk, 4);
+            snprintf(spec, sizeof spec, "id:%08" PRIx32 "+keyhex:%s", crc32_ref(pk, 32), hex);
+            refused |= targets_add(spec, 0) != NULL;    /* a reserved node ID: five in 2^32 */
+        }
+        if (!refused) {
+            g_run.hits = 0;
+            g_run.hits_wanted = targets_want(1);
+            atomic_store(&g_run.stop, 0);
+            filter_reset();
+            filter_publish();
+            be->window(state, NULL);
+            memcpy(&after, (const lane_t *)state + l, sizeof after);
+            bad += g_run.hits != 1 ||
+                   (memcmp(hits[0].secret, sk[0], 32) != 0 &&
+                    (planted == 1 || memcmp(hits[0].secret, sk[1], 32) != 0));
+            bad += memcmp(before.base, after.base, 32) == 0 || after.win != 0;
+            filter_reset();
+        }
+        secure_zero(sk, sizeof sk);
+    }
+#undef T_NOWHERE
+    t_check(bad == 0 && atomic_load(&g_run.faults) == 0,
+            "backend %s: a key planted in a window is found, and one key ends its base", be->name);
+
+    secure_zero(hits, sizeof hits);
+    g_run.mode = saved_mode;
+    g_run.hits_wanted = 0;
+    g_run.capture = NULL;
+    targets_clear();
+}
+
+/*
  * Run a backend for a few windows with matching disabled and compare what it
  * computed with the reference ladder: every key of the first window when
- * `full`, otherwise the keys at the window edges and the centre.
+ * `full`, otherwise the keys at the window edges and the centre, and for a
+ * kernel that goes through the table in several runs those at their joints.
+ * Then, on the same walk, the planted keys of test_planted.
  */
 static void test_walk(const backend_t *be, int full)
 {
@@ -4456,9 +5476,11 @@ static void test_walk(const backend_t *be, int full)
             for (unsigned j = 0; j < WINDOW; j++) {
                 const unsigned i = j > HALF_WINDOW ? j - HALF_WINDOW : HALF_WINDOW - j;
                 const int edge = i <= 1 || i == HALF_WINDOW;
+                /* where one run of the table meets the next: a matter of indices, one lane will do */
+                const int joint = be->runs > 1 && l == 0 && i % (HALF_WINDOW / be->runs) <= 1;
                 uint8_t sk[32], want[32], got[32];
 
-                if (!(edge || (full && win == 0)))
+                if (!(edge || (win == 0 && (full || joint))))
                     continue;
                 scalar_offset(sk, before[l].base, before[l].win * WINDOW + j);
                 x25519_ref(want, sk, BASE_U);
@@ -4470,6 +5492,7 @@ static void test_walk(const backend_t *be, int full)
         }
     }
     t_check(bad == 0, "backend %s: %u keys equal the reference ladder and CRC", be->name, checked);
+    test_planted(be, state, full);
 
     secure_zero(state, be->state_size);
     xfree_aligned(state);
@@ -4482,14 +5505,17 @@ static void test_walk(const backend_t *be, int full)
  * zero.  That never happens by chance (probability about 2^-240), so force
  * it: the lane must be abandoned and reseeded, the other lanes must carry on
  * undisturbed, and the reseeded lane must be right on the next window.
+ * Where there are lanes to spare, several are trapped at once, on points
+ * from different parts of the table and on the point that moves the centre.
  */
 static void test_exceptional_centre(const backend_t *be)
 {
-    const unsigned lanes = be->lanes, victim = be->lanes - 1;
+    const unsigned lanes = be->lanes;
     const size_t slots = (size_t)lanes * WINDOW;
     void *state = xalloc_aligned(be->state_size);
     walk_dump dump;
     lane_t before[MAX_LANES], after[MAX_LANES];
+    const mpoint *trap[MAX_LANES] = {NULL};
     unsigned bad = 0;
 
     dump.words = malloc(slots * sizeof *dump.words);
@@ -4500,7 +5526,17 @@ static void test_exceptional_centre(const backend_t *be)
     targets_clear();
     filter_reset();
     be->seed(state);
-    be->set_centre(state, victim, &TAB[7]);
+    trap[lanes - 1] = &TAB[7];
+    if (lanes >= 4)
+        trap[1] = &TAB[HALF_WINDOW];
+    if (lanes >= 8) {
+        trap[2] = &TABQ;
+        trap[4] = &TAB[HALF_WINDOW / 2 + 1];
+        trap[5] = &TAB[HALF_WINDOW / 4];
+    }
+    for (unsigned l = 0; l < lanes; l++)
+        if (trap[l] != NULL)
+            be->set_centre(state, l, trap[l]);
 
     for (int pass = 0; pass < 2; pass++) {
         memcpy(before, state, lanes * sizeof(lane_t));
@@ -4509,7 +5545,7 @@ static void test_exceptional_centre(const backend_t *be)
         for (unsigned l = 0; l < lanes; l++) {
             static const unsigned probe[] = {0, HALF_WINDOW - 1, HALF_WINDOW, HALF_WINDOW + 1,
                                              WINDOW - 1};
-            if (pass == 0 && l == victim) {
+            if (pass == 0 && trap[l] != NULL) {
                 bad += memcmp(before[l].base, after[l].base, 32) == 0 || after[l].win != 0;
                 continue;
             }
@@ -4787,6 +5823,261 @@ AVX2_FN static void test_avx2(int full)
     t_check(bad_crc == 0, "avx2 CRC-32 engines (PCLMULQDQ%s) match the reference",
             g_cpu.vpclmul ? ", VPCLMULQDQ" : "");
 }
+
+/* The AVX-512 field code and CRC engine against their scalar counterparts. */
+AVX512_FN static void test_avx512(int full)
+{
+    /* limbs at and around every bound the kernel relies on */
+    static const uint64_t any52[] = {       /* any limb a factor may have */
+        0, 1, 19, MASK51 - 19, MASK51 - 1, MASK51, MASK51 + 1, MASK51 + 2, 2 * MASK51,
+        2 * MASK51 + 1, 0x8000000000001ULL, 0xaaaaaaaaaaaaaULL, 0x5555555555555ULL,
+    };
+    static const uint64_t weak0[] = {       /* limb 0 of a weak element */
+        0, 1, MASK51 - 1, MASK51, MASK51 + 1, MASK51 + 0x1ffff, MASK51 + 0x20000,
+    };
+    static const uint64_t weak1[] = {       /* its other limbs */
+        0, 1, 0x4000000000000ULL, MASK51 - 1, MASK51,
+    };
+    const int rounds = full ? 600 : 32;
+    int bad_mul = 0, bad_sq = 0, bad_words = 0, bad_inv = 0, bad_crc = 0, bad_carry = 0;
+
+    for (int i = 0; i < rounds; i++) {
+        uint64_t la[5][8], lb[5][8], lr[5][8];
+        uint64_t grp[2][4][8];
+        uint32_t ids[16];
+        uint8_t sel[2][5][8];
+        fe a[8], b[8], want, got;
+        fe8 va, vb, vr;
+
+/* compare every lane of vec with the scalar result `expr` puts in want, and check vec is weak */
+#define T_COMPARE(counter, vec, expr)                                   \
+        do {                                                            \
+            fe8_store(&lr[0][0], &(vec));                               \
+            for (int l = 0; l < 8; l++) {                               \
+                for (int k = 0; k < 5; k++)                             \
+                    got.v[k] = lr[k][l];                                \
+                expr;                                                   \
+                counter += !fe_equal(&got, &want);                      \
+                counter += got.v[0] > MASK51 + 0x20000;                 \
+                for (int k = 1; k < 5; k++)                             \
+                    counter += got.v[k] > MASK51;                       \
+            }                                                           \
+        } while (0)
+#define T_LOAD()                                                        \
+        do {                                                            \
+            for (int l = 0; l < 8; l++)                                 \
+                for (int k = 0; k < 5; k++) {                           \
+                    la[k][l] = a[l].v[k];                               \
+                    lb[k][l] = b[l].v[k];                               \
+                }                                                       \
+            fe8_load(&va, &la[0][0]);                                   \
+            fe8_load(&vb, &lb[0][0]);                                   \
+        } while (0)
+
+        /* canonical operands */
+        for (int l = 0; l < 8; l++) {
+            uint8_t bytes[32];
+            random_field_bytes(bytes, 8 * i + l);
+            fe_from_bytes(&a[l], bytes);
+            fe_canonical(&a[l]);
+            random_field_bytes(bytes, (8 * i + l) * 5 + 2);
+            fe_from_bytes(&b[l], bytes);
+            fe_canonical(&b[l]);
+        }
+        T_LOAD();
+        fe8_mul(&vr, &va, &vb);
+        T_COMPARE(bad_mul, vr, fe_mul(&want, &a[l], &b[l]));
+        fe8_sq(&vr, &va);
+        T_COMPARE(bad_sq, vr, fe_sq(&want, &a[l]));
+        if (i < 12) {                       /* the first rounds hold zeros, which must be reported */
+            const unsigned zero = fe8_invert_lanes(&vr, &va);
+            fe8_store(&lr[0][0], &vr);
+            for (int l = 0; l < 8; l++) {
+                for (int k = 0; k < 5; k++)
+                    got.v[k] = lr[k][l];
+                fe_invert(&want, &a[l]);
+                bad_inv += ((zero >> l) & 1) != (unsigned)fe_is_zero(&a[l]);
+                bad_inv += !fe_is_zero(&a[l]) && !fe_equal(&got, &want);
+            }
+        }
+
+        /* the CRC engine on the encodings of a and b */
+        for (int l = 0; l < 8; l++) {
+            uint64_t ref[4];
+            fe_to_words(ref, &a[l]);
+            for (int k = 0; k < 4; k++)
+                grp[0][k][l] = ref[k];
+            fe_to_words(ref, &b[l]);
+            for (int k = 0; k < 4; k++)
+                grp[1][k][l] = ref[k] ^ (i == 3 ? ~(uint64_t)0 : 0);   /* also a non-field pattern */
+        }
+        crc_groups8((const uint64_t (*)[4][8])grp, ids, 2);
+        for (int g = 0; g < 2; g++) {
+            for (int l = 0; l < 8; l++) {
+                uint8_t bytes[32];
+                const uint64_t one[4] = {grp[g][0][l], grp[g][1][l], grp[g][2][l], grp[g][3][l]};
+                words_to_bytes(bytes, one);
+                bad_crc += ids[8 * g + l] != crc32_ref(bytes, 32);
+            }
+        }
+
+        /* factors with any 52-bit limbs, the largest included; squares of weak elements */
+        os_random(sel, sizeof sel);
+        for (int l = 0; l < 8; l++) {
+            for (int k = 0; k < 5; k++) {
+                uint64_t r[2];
+                os_random(r, sizeof r);
+                a[l].v[k] = sel[0][k][l] < 64 ? r[0] >> 12 : any52[sel[0][k][l] % ARRAY_LEN(any52)];
+                b[l].v[k] = sel[1][k][l] < 64 ? r[1] >> 12 : any52[sel[1][k][l] % ARRAY_LEN(any52)];
+            }
+        }
+        if (i == 0)                         /* every limb of every factor as large as it gets */
+            for (int l = 0; l < 8; l++)
+                for (int k = 0; k < 5; k++)
+                    a[l].v[k] = b[l].v[k] = 2 * MASK51 + 1;
+        T_LOAD();
+        fe8_mul(&vr, &va, &vb);
+        T_COMPARE(bad_mul, vr, fe_mul(&want, &a[l], &b[l]));
+
+        for (int l = 0; l < 8; l++) {
+            a[l].v[0] = sel[0][0][l] < 64 ? a[l].v[0] & MASK51 : weak0[sel[0][0][l] % ARRAY_LEN(weak0)];
+            for (int k = 1; k < 5; k++)
+                a[l].v[k] = sel[0][k][l] < 64 ? a[l].v[k] & MASK51
+                                              : weak1[sel[0][k][l] % ARRAY_LEN(weak1)];
+        }
+        if (i == 0)
+            for (int l = 0; l < 8; l++) {
+                a[l].v[0] = MASK51 + 0x20000;
+                for (int k = 1; k < 5; k++)
+                    a[l].v[k] = MASK51;
+            }
+        T_LOAD();
+        fe8_sq(&vr, &va);
+        T_COMPARE(bad_sq, vr, fe_sq(&want, &a[l]));
+#undef T_COMPARE
+#undef T_LOAD
+
+        /* the two carry chains on columns of up to 63 bits: the value and the promised bounds */
+        for (int l = 0; l < 8; l++)
+            for (int k = 0; k < 5; k++) {
+                uint64_t r;
+                os_random(&r, sizeof r);
+                la[k][l] = sel[1][k][l] < 32 ? ~(uint64_t)0 >> 1 : r >> (1 + sel[1][k][l] % 13);
+            }
+        for (int mode = 0; mode < 2; mode++) {
+            fe8_load(&vr, &la[0][0]);
+            if (mode == 0)
+                fe8_weak(&vr);
+            else
+                fe8_tight(&vr);
+            fe8_store(&lr[0][0], &vr);
+            for (int l = 0; l < 8; l++) {
+                for (int k = 0; k < 5; k++) {
+                    want.v[k] = la[k][l];
+                    got.v[k] = lr[k][l];
+                }
+                fe_carry(&want);
+                bad_carry += !fe_equal(&got, &want);
+                if (mode == 0) {
+                    bad_carry += got.v[0] > MASK51 + 0x20000;
+                    for (int k = 1; k < 5; k++)
+                        bad_carry += got.v[k] > MASK51;
+                } else {
+                    for (int k = 0; k < 5; k++)
+                        bad_carry += got.v[k] > MASK51 + 1;
+                }
+            }
+        }
+    }
+
+    /*
+     * Canonical encoding of x and of f^2 + e, with limbs drawn from values
+     * around every threshold FE8_FINISH tests.  One lane that needs the slow
+     * path sends the whole vector there, so every other vector is made of
+     * limbs that stop just short of the thresholds, and the first vectors
+     * hold p - 1, p and their neighbours in all eight lanes: the fast exit
+     * has to get the largest values it may see right, and must not take p.
+     */
+    for (int i = 0; i < 60 * rounds; i++) {
+        static const uint64_t pick[] = {
+            0, 1, 18, 19, MASK51 - 20, MASK51 - 19, MASK51 - 18, MASK51 - 1, MASK51, MASK51 + 1,
+            MASK51 + 19, 2 * MASK51, 2 * MASK51 + 2, ((uint64_t)1 << 53) - 1, 0x123456789abcdULL,
+            ((uint64_t)1 << 59) + 5,
+        };
+        static const uint64_t calm0[] = {0, 1, 18, 19, MASK51 - 20, MASK51 - 19, 0x123456789abcdULL};
+        static const uint64_t calm[] = {0, 1, 19, MASK51 - 1, MASK51, MASK51, 0x123456789abcdULL};
+        uint64_t lf[5][8], le[5][8], words[4][8];
+        uint8_t sel[5][8], zero_f;
+        fe8 vf, ve;
+        __m512i w[4];
+
+        os_random(sel, sizeof sel);
+        os_random(&zero_f, 1);
+        if ((i & 1) || i < 8)
+            zero_f = 0xff;                  /* nothing but e */
+        for (int l = 0; l < 8; l++) {
+            uint8_t bytes[32];
+            fe a;
+            random_field_bytes(bytes, (zero_f >> l) & 1 ? 0 : 99);     /* f = 0 isolates e */
+            fe_from_bytes(&a, bytes);
+            fe_canonical(&a);
+            for (int k = 0; k < 5; k++) {
+                lf[k][l] = a.v[k];
+                if (!(i & 1))
+                    le[k][l] = pick[sel[k][l] % ARRAY_LEN(pick)];
+                else if (k == 0)
+                    le[k][l] = calm0[sel[k][l] % ARRAY_LEN(calm0)];
+                else
+                    le[k][l] = calm[sel[k][l] % ARRAY_LEN(calm)];
+            }
+        }
+        if (i < 8)                          /* values around p, all lanes on the same path */
+            for (int l = 0; l < 8; l++) {
+                static const int first[8] = {0, -1, 1, -2, 9, -1, 17, -9};
+                static const int step[8] = {0, 0, 1, -1, 1, -100, 1, -1};
+                const int off = first[i] + step[i] * l;         /* this lane holds p + off */
+                le[0][l] = MASK51 - 18 + (uint64_t)(int64_t)(off > 18 ? 18 : off);
+                for (int k = 1; k < 5; k++)
+                    le[k][l] = MASK51;
+            }
+        fe8_load(&vf, &lf[0][0]);
+        fe8_load(&ve, &le[0][0]);
+
+        for (int mode = 0; mode < 2; mode++) {
+            if (mode == 0)
+                fe8_to_words(w, &ve);
+            else
+                fe8_sq_add_to_words(w, &vf, &ve);
+            for (int k = 0; k < 4; k++)
+                V8_STORE(words[k], w[k]);
+            for (int l = 0; l < 8; l++) {
+                uint64_t ref[4];
+                fe a, e, t;
+                for (int k = 0; k < 5; k++) {
+                    a.v[k] = lf[k][l];
+                    e.v[k] = le[k][l];
+                }
+                fe_carry(&e);
+                if (mode == 0) {
+                    t = e;
+                } else {
+                    fe_sq(&t, &a);
+                    fe_add_lazy(&t, &t, &e);
+                }
+                fe_to_words(ref, &t);
+                for (int k = 0; k < 4; k++)
+                    bad_words += words[k][l] != ref[k];
+            }
+        }
+    }
+
+    t_check(bad_mul == 0, "avx512 field: multiplication matches the scalar code (any 52-bit limbs)");
+    t_check(bad_sq == 0, "avx512 field: squaring matches the scalar code (canonical, weak)");
+    t_check(bad_inv == 0, "avx512 field: one inversion shared by eight lanes, zeros reported");
+    t_check(bad_carry == 0, "avx512 field: both carry chains keep the value and their bounds");
+    t_check(bad_words == 0, "avx512 field: canonical encoding and square-add-encode, both paths");
+    t_check(bad_crc == 0, "avx512 CRC-32 engine (VPCLMULQDQ, 512-bit) matches the reference");
+}
 #endif
 
 /* The progress line is made of whole pieces, as many as there is room for. */
@@ -4797,16 +6088,19 @@ static void test_status(void)
 
     for (size_t i = 0; i < ARRAY_LEN(all); i++) {
         status_add(all[i], "%d keys", 12345);
-        status_add(all[i], ", %.1f M/s", 67.89);
+        status_add(all[i], ", %s", "67.9 million keys/s");
         status_add(all[i], ", and a piece that is too long for a line of forty columns");
         status_add(all[i], ", x");              /* would fit, but nothing follows a gap */
     }
-    t_check(strcmp(wide.text, "12345 keys, 67.9 M/s") == 0 &&
+    t_check(strcmp(wide.text, "12345 keys, 67.9 million keys/s") == 0 &&
             strcmp(tight.text, "12345 keys") == 0 && none.text[0] == '\0',
             "progress line: whole pieces, as many as the terminal has room for");
 }
 
-/* Returns the number of failed checks.  `only` restricts the backend tests. */
+/*
+ * Returns the number of failed checks.  `only` restricts the tests to the
+ * kernel the user asked for: no instruction of another one is executed.
+ */
 static int self_test(int full, const backend_t *only)
 {
     t_failures = 0;
@@ -4817,14 +6111,20 @@ static int self_test(int full, const backend_t *only)
     test_curve(full);
     test_crc(full);
     test_targets(full);
-    test_filter(full);
+    test_filter(full, only);
     test_status();
 #ifdef MTV_X86
-    if (walk4_available())
+    if (walk4_available() && (only == NULL || only == &BACKEND_AVX2))
         test_avx2(full);
+    if (walk8_available() && (only == NULL || only == &BACKEND_AVX512))
+        test_avx512(full);
 #endif
     for (size_t i = 0; i < ARRAY_LEN(BACKENDS); i++) {
         const backend_t *be = BACKENDS[i];
+#ifdef MTV_CUDA
+        if (be == &BACKEND_CUDA)                /* too many lanes for these: its own tests follow */
+            continue;
+#endif
         if ((only != NULL && be != only) || !be->available())
             continue;
         test_walk(be, full);
@@ -4833,11 +6133,22 @@ static int self_test(int full, const backend_t *only)
             test_search(be);
         }
     }
+#ifdef MTV_CUDA
+    if (full && (only == NULL || only == &BACKEND_CUDA))
+        cuda_test_host();
+    /* under auto the GPU is checked as it comes up, beside the CPU search */
+    if ((full && only == NULL) || only == &BACKEND_CUDA) {
+        if (cuda_available())
+            cuda_self_test(full);
+        else if (full)
+            out_printf("cuda: checks skipped: %s\n", g_cuda.why);
+    }
+#endif
     return t_failures;
 }
 
 /* ======================================================================== */
-/* 13. Command line                                                          */
+/* 14. Command line                                                          */
 /* ======================================================================== */
 
 static void usage(int to)
@@ -4874,7 +6185,7 @@ static void usage(int to)
         "  --threads N        worker threads (default: every CPU)\n"
         "  --max-keys N       give up after trying about N keys\n"
         "  --backend NAME     auto (default: each thread times the kernels on its own\n"
-        "                     core and keeps the fastest), avx2 or scalar\n"
+        "                     core and keeps the fastest), avx512, avx2 or scalar\n"
         "  --no-pin           do not bind threads to CPUs\n"
         "  --json             print each key as one JSON object per line\n"
         "  --quiet            no progress or summary on stderr\n"
@@ -4890,21 +6201,29 @@ static void usage(int to)
 
     if (n > 0)
         (void)os_write(to, text, (size_t)n < sizeof text ? (size_t)n : sizeof text - 1);
+#ifdef MTV_CUDA
+    cuda_usage(to);
+#endif
 }
 
-/* Parse a non-negative integer argument strictly; returns -1 on any error. */
+/*
+ * Parse a non-negative integer argument strictly; returns -1 on any error.
+ * Written out rather than with strtoll: glibc 2.38 and later turn strtoll
+ * into a symbol that older systems lack, and the Linux GPU build is linked
+ * dynamically.
+ */
 static long long parse_count(const char *s)
 {
-    char *end;
-    long long v;
+    long long v = 0;
 
     if (s == NULL || *s < '0' || *s > '9')
         return -1;
-    errno = 0;
-    v = strtoll(s, &end, 10);
-    if (errno != 0 || *end != '\0')
-        return -1;
-    return v;
+    for (; *s >= '0' && *s <= '9'; s++) {
+        if (v > (LLONG_MAX - (*s - '0')) / 10)
+            return -1;                          /* too large */
+        v = 10 * v + (*s - '0');
+    }
+    return *s == '\0' ? v : -1;
 }
 
 static void run_benchmark(const backend_t *forced, int nthreads, int pin, double seconds)
@@ -4920,10 +6239,16 @@ static void run_benchmark(const backend_t *forced, int nthreads, int pin, double
         const backend_t *be = i < ARRAY_LEN(BACKENDS) ? BACKENDS[i] : NULL;
         const char *name = be ? be->name : "auto";
         run_result r;
-        char full_id[32], chosen[80] = "";
+        char full_id[32], speed[48], chosen[80] = "";
 
         if (forced != NULL && be != forced)
             continue;
+#ifdef MTV_CUDA
+        if (be == &BACKEND_CUDA && !be->available()) {
+            out_printf("  %-7s no usable GPU: %s\n", name, g_cuda.why);
+            continue;
+        }
+#endif
         if (be != NULL && !be->available()) {
             out_printf("  %-7s not supported by this CPU\n", name);
             continue;
@@ -4931,32 +6256,48 @@ static void run_benchmark(const backend_t *forced, int nthreads, int pin, double
         r = engine_run(be, nthreads, pin, seconds, 0, 0);
         if (r.keys == 0)
             continue;                       /* interrupted before the first window */
-        format_duration(full_id, sizeof full_id, 4294967296.0 * r.seconds / (double)r.keys);
+        format_duration(full_id, sizeof full_id, 4294967296.0 / r.rate);
+        format_rate(speed, sizeof speed, r.rate);
         if (be == NULL)
             snprintf(chosen, sizeof chosen, "   [%s]", r.kernels);
-        out_printf("  %-7s %8.1f M keys/s   full 8-digit ID in about %s%s\n", name,
-                   (double)r.keys / r.seconds / 1e6, full_id, chosen);
+        out_printf("  %-7s %20s   full 8-digit ID in about %s%s\n", name, speed, full_id, chosen);
     }
 }
 
 /* Say what is about to be searched for, and how much work that is. */
 static void print_plan(int nthreads, long long each)
 {
-    char count[40], extra[48] = "";
+    char count[40], extra[48] = "", who[160];
+    const char *on = "";
     int width = 0;
+
+    snprintf(who, sizeof who, "%d thread%s", nthreads, nthreads == 1 ? "" : "s");
+#ifdef MTV_CUDA
+    if (g_cuda.forced) {                        /* say what really runs */
+        snprintf(who, sizeof who, "the GPU (%s)", g_cuda.name);
+        on = "on ";
+    } else if (g_cuda.auto_on) {
+        const int first = g_cuda.cpu_join > 0 ? nthreads : nthreads - cuda_spare(nthreads);
+        snprintf(who, sizeof who, "%d thread%s %s", first, first == 1 ? "" : "s",
+                 g_cuda.cpu_join > 0 ? "and the GPU when it is ready" : "until the GPU is ready");
+    }
+#endif
 
     /* first of all which build this is: a report of trouble is worth little without it */
     err_printf("mtvanity %s (source revision %d)\n", MTV_VERSION, MTV_REVISION);
+#ifdef MTV_CUDA
+    if (g_cuda.note)
+        err_printf("no usable GPU: %s; searching on the CPU\n", g_cuda.why);
+#endif
     if (each > 1)
         snprintf(extra, sizeof extra, ", %lld keys %s", each, g_targets == 1 ? "wanted" : "each");
     if (g_targets == 1) {
         format_count(count, sizeof count, 1.0 / g_target[0].chance);
-        err_printf("searching for %s: about %s keys per hit, %d thread%s%s\n\n",
-                   g_target[0].text, count, nthreads, nthreads == 1 ? "" : "s", extra);
+        err_printf("searching for %s: about %s keys per hit, %s%s%s\n\n",
+                   g_target[0].text, count, on, who, extra);
         return;
     }
-    err_printf("searching for %d targets on %d thread%s%s\n", g_targets, nthreads,
-               nthreads == 1 ? "" : "s", extra);
+    err_printf("searching for %d targets on %s%s\n", g_targets, who, extra);
     for (int k = 0; k < g_targets; k++)
         width = (int)strlen(g_target[k].text) > width ? (int)strlen(g_target[k].text) : width;
     width = width > 44 ? 44 : width;
@@ -4971,18 +6312,19 @@ static void print_plan(int nthreads, long long each)
 /* What came of it: one line in all, and one per target when there were several. */
 static void print_outcome(const run_result *res)
 {
-    char count[40], found[64];
+    char count[40], found[64], speed[48];
     int width = 0;
 
     format_count(count, sizeof count, (double)res->keys);
+    format_rate(speed, sizeof speed, res->seconds > 0.0 ? (double)res->keys / res->seconds : 0.0);
     if (g_run.hits_wanted == 1)
         snprintf(found, sizeof found, "%" PRIu64 " key%s found", g_run.hits,
                  g_run.hits == 1 ? "" : "s");
     else
         snprintf(found, sizeof found, "%" PRIu64 " of %" PRIu64 " keys found", g_run.hits,
                  g_run.hits_wanted);
-    err_printf("%s; %s keys tried in %.2f s (%.1f M/s; kernels: %s)%s\n", found, count,
-               res->seconds, (double)res->keys / res->seconds / 1e6,
+    err_printf("%s; %s keys tried in %.2f s (%s; kernels: %s)%s\n", found, count,
+               res->seconds, speed,
                res->kernels[0] ? res->kernels : "none", g_interrupted ? "; interrupted" : "");
 
     if (g_targets > 1) {
@@ -5014,7 +6356,10 @@ int main(int argc, char **argv)
     const char *spec[MAX_TARGETS], *backend_name = NULL, *err;
     const backend_t *be;
     int specs = 0, nthreads = 0, quiet = 0, json = 0, bench = 0, selftest = 0, pin = 1;
-    int ignore_case = 0;
+    int ignore_case = 0, failed_checks;
+#ifdef MTV_CUDA
+    int fell_back = 0;                      /* --backend cuda found no usable GPU */
+#endif
     double bench_seconds = 5.0;
     unsigned long long key_limit = 0;
     long long hits_wanted = 1;
@@ -5072,6 +6417,24 @@ int main(int argc, char **argv)
                 bench_seconds = (double)v;
                 i++;
             }
+#ifdef MTV_CUDA
+        } else if (strcmp(a, "--cuda-ptx") == 0) {
+            char *ptx = cuda_ptx(0);
+            (void)os_write(TO_STDOUT, ptx, strlen(ptx));
+            free(ptx);
+            return 0;
+#  ifdef MTV_CUDA_FAULTS
+        } else if (strcmp(a, "--cuda-fault") == 0) {     /* break the kernel in one place, then test */
+            g_cuda.fault = next != NULL ? atoi(next) : 0;
+            i++;
+        } else if (strcmp(a, "--cuda-fail-at") == 0) {   /* lose the GPU after N launches of a search */
+            const long long v = parse_count(next);
+            if (v < 1 || v > 1000000)
+                die("--cuda-fail-at needs a number between 1 and 1000000");
+            g_cuda.fail_at = (unsigned)v;
+            i++;
+#  endif
+#endif
         } else if (a[0] == '-' && a[1] == '-') {
             err_printf("mtvanity: unknown option %s (try --help)\n", a);
             return 2;
@@ -5109,6 +6472,23 @@ int main(int argc, char **argv)
     walk4_init();
 #endif
 
+#if defined(MTV_CUDA) && defined(MTV_CUDA_FAULTS)
+    if (g_cuda.fault < 0) {                     /* only the check that needs no GPU: for the checkers */
+        t_failures = 0;
+        cuda_test_host();
+        return t_failures != 0;
+    }
+    if (g_cuda.fault != 0) {
+        if (!cuda_available()) {
+            out_printf("fault %d: no result: %s\n", g_cuda.fault, g_cuda.why);
+            return 2;
+        }
+        t_failures = 0;
+        cuda_self_test(1);
+        out_printf("fault %d: %d check(s) failed\n", g_cuda.fault, t_failures);
+        return t_failures ? 1 : 0;
+    }
+#endif
     if (selftest) {
         int failed;
         out_printf("mtvanity %s (source revision %d) self-test\n", MTV_VERSION, MTV_REVISION);
@@ -5133,9 +6513,25 @@ int main(int argc, char **argv)
             err_printf("mtvanity: unknown --backend; choose one of: %s\n", names);
             return 2;
         }
-        if (!be->available())
+#ifdef MTV_CUDA
+        if (be == &BACKEND_CUDA && !be->available()) {  /* say why, and search on the CPU */
+            err_printf("mtvanity: --backend cuda: %s; searching on the CPU instead\n", g_cuda.why);
+            be = NULL;
+            fell_back = 1;
+        }
+#endif
+        if (be != NULL && !be->available())
             die("this CPU does not support the requested --backend");
     }
+#ifdef MTV_CUDA
+    g_cuda.cpu_join = nthreads;             /* --threads with a GPU: CPU threads beside it */
+    g_cuda.forced = be == &BACKEND_CUDA;
+    /* auto: try the GPU if there is a driver library and nothing has ruled the GPU out */
+    g_cuda.auto_on = be == NULL && g_cuda.state >= 0 && cuda_bind() == 0;
+    if (be == NULL && !g_cuda.auto_on && g_cuda.state == 0)
+        (void)cuda_fail("no NVIDIA driver library (%s) was found", MTV_CUDA_LIB);
+    g_cuda.note = be == NULL && !g_cuda.auto_on && !fell_back;  /* the plan says why the CPU searches */
+#endif
     if (nthreads == 0)
         nthreads = os_cpu_count();
     if (nthreads > MAX_THREADS)
@@ -5144,7 +6540,17 @@ int main(int argc, char **argv)
     pin = pin && nthreads == os_cpu_count();
 
     /* Never search with arithmetic that has not just been checked. */
-    if (self_test(0, be) != 0)
+    failed_checks = self_test(0, be);
+#ifdef MTV_CUDA
+    if (failed_checks != 0 && be == &BACKEND_CUDA) {    /* not this GPU, then: the CPU, checked in its turn */
+        cuda_fail_check();
+        err_printf("mtvanity: --backend cuda: %s; searching on the CPU instead\n", g_cuda.why);
+        be = NULL;
+        g_cuda.forced = 0;
+        failed_checks = self_test(0, NULL);
+    }
+#endif
+    if (failed_checks != 0)
         die("the start-up self-test failed; refusing to generate keys");
 
     /* from here on Ctrl-C (or a polite kill) ends the search and still gets its summary */
@@ -5172,6 +6578,10 @@ int main(int argc, char **argv)
     if (atomic_load(&g_run.faults) != 0)
         err_printf("mtvanity: warning: %llu candidate(s) failed verification and were "
                    "discarded; please report this\n", atomic_load(&g_run.faults));
+#ifdef MTV_CUDA
+    if (g_cuda.orphan && !g_run.output_failed)  /* the GPU thread is still inside the driver: leave without it */
+        _Exit(g_run.hits >= g_run.hits_wanted ? 0 : 3);
+#endif
     if (g_run.output_failed) {
         err_printf("mtvanity: a key could not be written to stdout (disk full? pipe closed?); "
                    "that key is lost and the search was stopped\n");
